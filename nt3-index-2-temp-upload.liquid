@@ -1,250 +1,247 @@
- closeDrawer() {
-    overlay.classList.remove('open');
-    drawer.classList.remove('open');
-    drawer.setAttribute('aria-hidden', 'true');
-    document.body.style.overflow = '';
-    setTimeout(() => { overlay.hidden = true; }, 650);
-  }
-  toggle.addEventListener('click', openDrawer);
-  closeBtn.addEventListener('click', closeDrawer);
-  overlay.addEventListener('click', closeDrawer);
-  addEventListener('keydown', (e) => {
-    if (e.key === 'Escape' && drawer.classList.contains('open')) closeDrawer();
-  });
+/* Scroll-driven scene behaviours:
+   - Discover: one fixed frame whose image and caption change per step.
+   - Materials: the macro photograph zooms slowly while scrolling.
+   - Goodnight: newsletter submit feedback. */
+function initScenes() {
+  initDiscover();
+  initMacroZoom();
+  initReviews();
+  initNewsletter();
+}
 
-  itemsEl.addEventListener('click', (e) => {
-    const btn = e.target.closest('button[data-action]');
-    if (!btn) return;
-    const item = items.find((i) => i.key === btn.dataset.key);
-    if (!item) return;
-    if (btn.dataset.action === 'inc') item.qty += 1;
-    if (btn.dataset.action === 'dec') item.qty -= 1;
-    items = items.filter((i) => i.qty > 0);
-    save();
-    render();
-  });
+const clampR = (x, a = 0, b = 1) => Math.min(b, Math.max(a, x));
 
-  const VARIANT_IDS = {
-    pillowcrescent: 56851707429204,
-    pilloweclipse: 56851707461972,
-    casecrescent: { moonlight: 56850855461204, nebula: 56850855493972, polaris: 56850855526740, aurora: 56850855657812, venus: 56850855723348 },
-    caseeclipse: { moonlight: 56850855559508, nebula: 56850855592276, polaris: 56850855625044, aurora: 56850855690580, venus: 56850855756116 }
-  };
-  function resolveVariantId(item) {
-    const v = VARIANT_IDS[item.id];
-    if (!v) return null;
-    if (typeof v === 'number') return v;
-    const text = (item.variant || '').toLowerCase();
-    const colors = ['moonlight', 'nebula', 'polaris', 'aurora', 'venus'];
-    const found = colors.find((c) => text.indexOf(c) !== -1);
-    return v[found || 'moonlight'];
-  }
-  async function goToCheckout(extraQuery) {
-    const parts = items
-      .map((i) => { const vid = resolveVariantId(i); return vid ? { id: vid, quantity: i.qty } : null; })
-      .filter(Boolean);
-    if (!parts.length) return;
-    const bundleCode = items.some((i) => i.dealNote && i.dealNote.includes('Nottera Eos Set'))
-      ? 'EOS15'
-      : items.some((i) => i.dealNote && i.dealNote.includes('Nottera Nocturne Set'))
-      ? 'NOCTURNE20'
-      : items.some((i) => i.dealNote && i.dealNote.includes('Volume · 15% off'))
-      ? 'VOL15'
-      : items.some((i) => i.dealNote && i.dealNote.includes('Volume · 10% off'))
-      ? 'VOL10'
-      : null;
+function initReviews() {
+  const summaryEl = document.getElementById('ratingSummary');
+  const cardsEl = document.getElementById('reviewsCards');
+  if (!summaryEl && !cardsEl) return;
+
+  const PENDING_KEY = 'notterra-pending-reviews';
+  const SEED = {};
+  const REVIEWS = [];
+
+  function savePendingReview(r) {
     try {
-      await fetch('/cart/clear.js', { method: 'POST', credentials: 'same-origin' });
-      const addRes = await fetch('/cart/add.js', {
-        method: 'POST',
-        credentials: 'same-origin',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ items: parts })
-      });
-      if (!addRes.ok) {
-        const err = await addRes.json().catch(() => ({}));
-        console.error('Nottera cart add failed:', addRes.status, err);
-        showToast((err && err.description) || 'Something went wrong adding your items — please try again.');
-        return;
-      }
-    } catch (e) {
-      console.error('Nottera cart add failed:', e);
-      showToast('Something went wrong adding your items — please try again.');
+      const raw = localStorage.getItem(PENDING_KEY);
+      const list = raw ? JSON.parse(raw) : [];
+      list.push(r);
+      localStorage.setItem(PENDING_KEY, JSON.stringify(list));
+    } catch {}
+  }
+
+  function starString(n) {
+    return `<span class="social-stars-fill" style="position:static;overflow:visible;display:inline">${'★'.repeat(n)}</span>${'☆'.repeat(5 - n)}`;
+  }
+
+  function renderSummary() {
+    if (!summaryEl) return;
+    const total = Object.values(SEED).reduce((a, b) => a + b, 0);
+    if (!total) {
+      summaryEl.innerHTML = `
+        <div class="rating-summary-main rating-summary-empty">
+          <span class="rating-empty-text">We're brand new — no reviews yet. Your 60-night trial is the real guarantee.</span>
+        </div>
+        <button class="btn write-review-btn" type="button" id="writeReviewBtn">Write a Review</button>`;
+      document.getElementById('writeReviewBtn').addEventListener('click', openReviewModal);
       return;
     }
-    const qs = [];
-    if (bundleCode) qs.push('discount=' + bundleCode);
-    if (extraQuery) qs.push(extraQuery);
-    window.location.href = '/checkout' + (qs.length ? '?' + qs.join('&') : '');
-  }
-  function orderSnapshot() {
-    return items.map((i) => ({ name: PRODUCTS[i.id].name, variant: i.variant || '', qty: i.qty, price: priceOf(i) }));
-  }
-  drawer.querySelector('.cart-checkout').addEventListener('click', () => {
-    if (!items.length) return;
-    const total = items.reduce((n, i) => n + i.qty * priceOf(i), 0);
-    window.NotteraAccount?.creditPurchasePoints(total);
-    window.NotteraAccount?.recordOrder(orderSnapshot(), total);
-    goToCheckout();
-  });
-  drawer.querySelector('.cart-paypal').addEventListener('click', () => {
-    if (!items.length) return;
-    const total = items.reduce((n, i) => n + i.qty * priceOf(i), 0);
-    window.NotteraAccount?.creditPurchasePoints(total);
-    window.NotteraAccount?.recordOrder(orderSnapshot(), total);
-    goToCheckout('payment=paypal');
-  });
-  drawer.querySelector('.cart-applepay').addEventListener('click', () => {
-    if (!items.length) return;
-    const total = items.reduce((n, i) => n + i.qty * priceOf(i), 0);
-    window.NotteraAccount?.creditPurchasePoints(total);
-    window.NotteraAccount?.recordOrder(orderSnapshot(), total);
-    goToCheckout('payment=apple_pay');
-  });
-
-  function render() {
-    const count = items.reduce((n, i) => n + i.qty, 0);
-    const total = items.reduce((n, i) => n + i.qty * priceOf(i), 0);
-
-    countEl.hidden = count === 0;
-    countEl.textContent = count;
-    emptyEl.hidden = count > 0;
-    footEl.hidden = count === 0;
-    totalEl.textContent = money(total);
-    if (financeEl) financeEl.textContent = 'or 4 interest-free payments of ' + money(total / 4) + ' with Shop Pay';
-    if (pointsEl) pointsEl.textContent = count > 0 ? `Check out now and earn ${Math.round(total * 2)} Nottera Rewards points` : '';
-
-    itemsEl.innerHTML = items.map((i) => {
-      if (i.id === 'guide') {
-        return `
-      <li class="cart-item cart-item-gift">
-        <div class="cart-item-info">
-          <h5>${PRODUCTS[i.id].name}</h5>
-          <p class="cart-line-note gold">Free gift · unlocked on this order</p>
-        </div>
-        <span class="cart-item-price"><span class="cart-item-free">FREE</span></span>
-      </li>`;
-      }
-      const hasDeal = typeof i.dealPrice === 'number';
-      const active = dealActive(i);
-      const dealNote = hasDeal
-        ? (active
-            ? `<p class="cart-line-note gold">${i.dealNote || ('Bundle price · $' + (PRODUCTS[i.id].price - i.dealPrice).toFixed(0) + ' off')}</p>`
-            : (i.dealRequires
-                ? `<p class="cart-line-note warn">Add ${(Array.isArray(i.dealRequires) ? i.dealRequires : [i.dealRequires]).map((rid) => PRODUCTS[rid].name).join(' + ')} to unlock $${(PRODUCTS[i.id].price - i.dealPrice).toFixed(0)} off</p>`
-                : `<p class="cart-line-note warn">Add ${i.dealMinQty - i.qty} more to unlock $${(PRODUCTS[i.id].price - i.dealPrice).toFixed(0)} off each</p>`))
-        : '';
-      const note = (i.variant ? `<p>${i.variant}</p>` : '') + dealNote;
-      return `
-      <li class="cart-item">
-        <div class="cart-item-info">
-          <h5>${PRODUCTS[i.id].name}</h5>
-          ${note}
-        </div>
-        <div class="cart-item-qty">
-          <button data-action="dec" data-key="${i.key}" aria-label="Decrease quantity">−</button>
-          <span>${i.qty}</span>
-          <button data-action="inc" data-key="${i.key}" aria-label="Increase quantity">+</button>
-        </div>
-        <span class="cart-item-price">
-          ${active ? `<span class="cart-item-was">${money(i.qty * PRODUCTS[i.id].price)}</span>` : ''}
-          ${money(i.qty * priceOf(i))}
-        </span>
-      </li>`;
-    }).join('');
-
-    renderUpsell();
-  }
-
-  function upsellCard(offer) {
-    const p = PRODUCTS[offer.id];
-    const isCase = /^case(crescent|eclipse)$/.test(offer.id);
-    const isPillow = /^pillow(crescent|eclipse)$/.test(offer.id);
-    const img = isCase ? ((window.NOTTERA_CASE_HERO || {}).moonlight || p.img)
-      : isPillow ? ((window.NOTTERA_PILLOW_HERO || {})[offer.id.replace('pillow', '')] || p.img)
-      : p.img;
-    return `
-      <p class="cart-upsell-head">${offer.tag}</p>
-      <div class="cart-upsell-card">
-        <img src="${img}" alt="" loading="lazy">
-        <div class="cart-upsell-info">
-          <h6>${p.name}</h6>
-          <p>${offer.line}</p>
-          <span class="cart-upsell-price">${money(p.price)}</span>
-        </div>
-        <button class="cart-upsell-add" type="button" data-add="${offer.id}" data-variant="${offer.variant}" aria-label="Add ${p.name}">Add +</button>
+    const weighted = Object.entries(SEED).reduce((a, [s, c]) => a + Number(s) * c, 0);
+    const avg = (weighted / total).toFixed(1);
+    const bars = [5, 4, 3, 2, 1].map((n) => {
+      const count = SEED[n];
+      const pct = Math.round((count / total) * 100);
+      return `<div class="rating-bar-row">
+        <span class="rating-bar-label">${n} star</span>
+        <span class="rating-bar-track"><span class="rating-bar-fill" style="width:${pct}%"></span></span>
+        <span class="rating-bar-count">${count}</span>
       </div>`;
+    }).join('');
+    summaryEl.innerHTML = `
+      <div class="rating-summary-main">
+        <span class="rating-big">${avg}</span>
+        <span class="social-stars">${starString(Math.round(avg))}</span>
+        <span class="rating-count">${total} reviews</span>
+      </div>
+      <div class="rating-bars">${bars}</div>
+      <button class="btn write-review-btn" type="button" id="writeReviewBtn">Write a Review</button>`;
+    document.getElementById('writeReviewBtn').addEventListener('click', openReviewModal);
   }
-  function pickUpsell() {
-    const pillowItem = items.find((i) => i.id === 'pillowcrescent' || i.id === 'pilloweclipse');
-    const caseItem = items.find((i) => /^case(crescent|eclipse)$/.test(i.id));
-    const sizeOf = (i) => (/eclipse/.test(i.id) ? 'eclipse' : 'crescent');
-    const sizeName = (k) => (k === 'eclipse' ? 'Eclipse' : 'Crescent');
 
-    if (pillowItem && !caseItem) {
-      const size = sizeOf(pillowItem), id = 'case' + size;
-      return { id, variant: `Ice-Silk · Moonlight · ${sizeName(size)}`, tag: 'Complete your set',
-        line: `Add an ice-silk pillowcase in ${sizeName(size)} to match your pillow.` };
-    }
-    if (caseItem && !pillowItem) {
-      const size = sizeOf(caseItem), id = 'pillow' + size;
-      return { id, variant: `Nottera Pillow · ${sizeName(size)}`, tag: 'Complete your set',
-        line: `Add the Nottera Pillow in ${sizeName(size)} to match your pillowcase.` };
-    }
-    return null;
+  function renderCards() {
+    if (!cardsEl) return;
+    cardsEl.innerHTML = REVIEWS.map((r) => `
+      <div class="review-card">
+        <span class="social-stars">${starString(r.stars)}</span>
+        <p class="review-card-text">&ldquo;${r.text}&rdquo;</p>
+        <p class="review-card-person">${r.name} &middot; ${r.place}</p>
+      </div>`).join('');
   }
-  function renderUpsell() {
-    if (!upsellEl) return;
-    if (items.length === 0) { upsellEl.hidden = true; upsellEl.innerHTML = ''; return; }
-    const offer = pickUpsell();
-    if (!offer) { upsellEl.hidden = true; upsellEl.innerHTML = ''; return; }
-    upsellEl.hidden = false;
-    upsellEl.innerHTML = upsellCard(offer);
+
+  const modal = document.createElement('div');
+  modal.className = 'popup-overlay';
+  modal.innerHTML = `
+    <div class="popup review-modal" role="dialog" aria-modal="true" aria-labelledby="reviewModalTitle">
+      <button class="popup-close" type="button" aria-label="Close">&times;</button>
+      <p class="popup-kicker">Share your night</p>
+      <h3 id="reviewModalTitle">Write a review</h3>
+      <div class="review-star-picker" role="radiogroup" aria-label="Your rating">
+        ${[1, 2, 3, 4, 5].map((n) => `<button type="button" data-star="${n}" aria-label="${n} star${n > 1 ? 's' : ''}">★</button>`).join('')}
+      </div>
+      <form class="popup-form review-form" novalidate>
+        <input type="text" class="popup-input" name="name" placeholder="Your name" maxlength="40" required>
+        <textarea class="popup-input review-textarea" name="text" placeholder="Tell us about your nights with Nottera..." maxlength="400" rows="4" required></textarea>
+        <button type="submit" class="btn btn-primary popup-submit">Submit review</button>
+      </form>
+      <p class="popup-success review-success" hidden>Thank you — your review has been submitted and will appear once our team reviews it.</p>
+    </div>`;
+  document.body.appendChild(modal);
+
+  const picker = modal.querySelector('.review-star-picker');
+  const form = modal.querySelector('.review-form');
+  const successEl = modal.querySelector('.review-success');
+  let selectedStars = 0;
+
+  picker.querySelectorAll('button').forEach((b) => b.addEventListener('click', () => {
+    selectedStars = Number(b.dataset.star);
+    picker.querySelectorAll('button').forEach((x) => x.classList.toggle('on', Number(x.dataset.star) <= selectedStars));
+  }));
+
+  function resetModal() {
+    form.reset();
+    form.hidden = false;
+    form.classList.remove('invalid');
+    picker.hidden = false;
+    picker.querySelectorAll('button').forEach((x) => x.classList.remove('on'));
+    selectedStars = 0;
+    successEl.hidden = true;
   }
-  upsellEl?.addEventListener('click', (e) => {
-    const btn = e.target.closest('[data-add]');
-    if (!btn) return;
-    addItem(btn.dataset.add, btn.dataset.variant || '', 1, null);
-    showToast(PRODUCTS[btn.dataset.add].name + ' added to your night');
+  function openReviewModal() {
+    resetModal();
+    modal.classList.add('open');
+    document.body.style.overflow = 'hidden';
+  }
+  function closeReviewModal() {
+    modal.classList.remove('open');
+    document.body.style.overflow = '';
+  }
+  modal.querySelector('.popup-close').addEventListener('click', closeReviewModal);
+  modal.addEventListener('click', (e) => { if (e.target === modal) closeReviewModal(); });
+  addEventListener('keydown', (e) => { if (e.key === 'Escape' && modal.classList.contains('open')) closeReviewModal(); });
+
+  form.addEventListener('submit', (e) => {
+    e.preventDefault();
+    const name = form.name.value.trim();
+    const text = form.text.value.trim();
+    if (!name || !text || !selectedStars) {
+      form.classList.add('invalid');
+      form.name.classList.toggle('error', !name);
+      form.text.classList.toggle('error', !text);
+      return;
+    }
+    savePendingReview({ name, text, stars: selectedStars, ts: Date.now() });
+
+    form.hidden = true;
+    picker.hidden = true;
+    successEl.hidden = false;
+    setTimeout(closeReviewModal, 2200);
   });
+  form.name.addEventListener('input', () => form.name.classList.remove('error'));
+  form.text.addEventListener('input', () => form.text.classList.remove('error'));
 
-  function showToast(message) {
-    toast.textContent = message;
-    toast.classList.add('show');
-    clearTimeout(toastTimer);
-    toastTimer = setTimeout(() => toast.classList.remove('show'), 3200);
-  }
-
-  function load() {
-    try {
-      const raw = localStorage.getItem(STORAGE_KEY);
-      const parsed = raw ? JSON.parse(raw) : [];
-      return Array.isArray(parsed)
-        ? parsed.filter((i) => PRODUCTS[i.id] && i.qty > 0)
-        : [];
-    } catch {
-      return [];
-    }
-  }
-  function save() {
-    try { localStorage.setItem(STORAGE_KEY, JSON.stringify(items)); } catch {}
-  }
-
-  window.NotteraCart = {
-    add(id, variant = '', qty = 1, deal = null) {
-      addItem(id, variant, qty, deal);
-      const p = PRODUCTS[id];
-      if (p && id !== 'guide') showToast(p.name + (variant ? ' · ' + variant : '') + ' added to your night');
-    },
-    remove(id) {
-      const idx = items.findIndex((i) => i.id === id);
-      if (idx > -1) { items.splice(idx, 1); save(); render(); }
-    },
-    getTotal() { return items.reduce((n, i) => (i.id === 'guide' ? n : n + i.qty * priceOf(i)), 0); },
-    open: openDrawer,
-    catalog: PRODUCTS
-  };
-
-  render();
+  renderSummary();
+  renderCards();
 }
-END_LARGE_TEST_v3
+
+function initDiscover() {
+  const track = document.getElementById('discoverTrack');
+  if (!track) return;
+  const images = track.querySelectorAll('[data-step-img]');
+  const captions = track.querySelectorAll('[data-step-caption]');
+
+  function activate(step) {
+    images.forEach((el) => el.classList.toggle('active', el.dataset.stepImg === step));
+    captions.forEach((el) => el.classList.toggle('active', el.dataset.stepCaption === step));
+  }
+
+  const io = new IntersectionObserver((entries) => {
+    for (const entry of entries) {
+      if (entry.isIntersecting) activate(entry.target.dataset.step);
+    }
+  }, { rootMargin: '-45% 0px -45% 0px' });
+
+  track.querySelectorAll('.discover-step').forEach((el) => io.observe(el));
+}
+
+function initMacroZoom() {
+  const img = document.getElementById('macroZoom');
+  if (!img) return;
+  if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) return;
+  let ticking = false;
+
+  function update() {
+    const rect = img.parentElement.getBoundingClientRect();
+    if (rect.bottom < 0 || rect.top > innerHeight) return;
+    const progress = 1 - (rect.bottom / (innerHeight + rect.height));
+    const zoom = 1 + Math.min(1, Math.max(0, progress)) * 0.18;
+    img.style.setProperty('--macro-zoom', zoom.toFixed(4));
+    img.style.transform = `scale(${zoom.toFixed(4)})`;
+  }
+
+  addEventListener('scroll', () => {
+    if (!ticking) {
+      requestAnimationFrame(() => { update(); ticking = false; });
+      ticking = true;
+    }
+  }, { passive: true });
+  update();
+}
+
+function notteraKlaviyoSubscribe(email) {
+  return fetch('https://a.klaviyo.com/client/subscriptions?company_id=YApgMC', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/vnd.api+json',
+      'revision': '2024-10-15'
+    },
+    body: JSON.stringify({
+      data: {
+        type: 'subscription',
+        attributes: {
+          profile: {
+            data: {
+              type: 'profile',
+              attributes: {
+                email: email,
+                subscriptions: {
+                  email: { marketing: { consent: 'SUBSCRIBED' } }
+                }
+              }
+            }
+          }
+        },
+        relationships: {
+          list: { data: { type: 'list', id: 'Uqidh7' } }
+        }
+      }
+    })
+  }).catch(function(err){ console.error('Klaviyo subscribe failed:', err); });
+}
+
+function initNewsletter() {
+  const form = document.getElementById('newsletter');
+  if (!form) return;
+  const toast = document.getElementById('toast');
+
+  form.addEventListener('submit', (e) => {
+    e.preventDefault();
+    const email = form.email.value.trim();
+    const valid = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
+    toast.textContent = valid
+      ? 'Welcome to calmer nights. Check your inbox soon.'
+      : 'Please enter a valid email address.';
+    toast.classList.add('show');
+    setTimeout(() => toast.classList.remove('show'), 3200);
+    if (valid) { form.reset(); notteraKlaviyoSubscribe(email); }
+  });
+}
+END_PART3_MARKER
