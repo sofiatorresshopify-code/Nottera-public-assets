@@ -1,1 +1,43 @@
- closeDrawer() {\n    overlay.classList.remove('open');\n TESTPLACEHOLDER
+ closeDrawer() {
+    overlay.classList.remove('open');
+    drawer.classList.remove('open');
+    drawer.setAttribute('aria-hidden', 'true');
+    document.body.style.overflow = '';
+    setTimeout(() => { overlay.hidden = true; }, 650);
+  }
+  toggle.addEventListener('click', openDrawer);
+  closeBtn.addEventListener('click', closeDrawer);
+  overlay.addEventListener('click', closeDrawer);
+  addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && drawer.classList.contains('open')) closeDrawer();
+  });
+
+  /* ---- quantity changes (event delegation) ---- */
+  itemsEl.addEventListener('click', (e) => {
+    const btn = e.target.closest('button[data-action]');
+    if (!btn) return;
+    const item = items.find((i) => i.key === btn.dataset.key);
+    if (!item) return;
+    if (btn.dataset.action === 'inc') item.qty += 1;
+    if (btn.dataset.action === 'dec') item.qty -= 1;
+    items = items.filter((i) => i.qty > 0);
+    save();
+    render();
+  });
+
+  /* ---- checkout: Shopify cart permalink ----
+     Builds /cart/{variantId}:{qty},... and lets Shopify's own cart + checkout
+     take over from there (real payment, address, guest checkout). Real
+     Shopify variant IDs, mapped from each cart line's product id + the
+     colour named in its free-text variant label (pillowcases carry both
+     a size and a colour; the pillow only has a size). 'guide' is a $0
+     gift-with-purchase line in this UI but a real $29.99 product in
+     Shopify, so it's deliberately excluded from checkout — sending it
+     would charge the customer for something shown as free. */
+  const VARIANT_IDS = {
+    pillowcrescent: 56851707429204,
+    pilloweclipse: 56851707461972,
+    casecrescent: { moonlight: 56850855461204, nebula: 56850855493972, polaris: 56850855526740, aurora: 56850855657812, venus: 56850855723348 },
+    caseeclipse: { moonlight: 56850855559508, nebula: 56850855592276, polaris: 56850855625044, aurora: 56850855690580, venus: 56850855756116 }
+  };
+END_LARGE_TEST_v3
