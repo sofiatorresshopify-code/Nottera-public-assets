@@ -1,1 +1,41 @@
-PLACEHOLDER_KEEP_SMALL_TEST
+/* In-site legal & policy pages. Footer links route to #/slug; each opens an
+   overlay "page" that shares the site's palette and type over the night sky.
+   Content is the public policy text; brand-aesthetic styles live in styles.css. */
+
+const PAGES = {
+  "pillow": {
+    nav: "Pillows", "kicker": "Pillow",
+    "title": "The Nottera Pillow.",
+    "body": "<div id=\"pillowRoot\"></div>"
+  },
+  "bed": {
+    nav: "Bedding", "kicker": "Pillow Bedding",
+    "title": "Pillowcases.",
+    "body": "<div id=\"bedRoot\"></div>"
+  },
+  "bundles": {
+    nav: "Bundles & Sets", "kicker": "Bundles & Sets",
+    "title": "Buy the ritual together.",
+    "body": "<div id=\"bundlesRoot\"></div>"
+  },
+  "orders": {
+    nav: "My Orders", "kicker": "Account",
+    "title": "My Orders.",
+    "body": "<p class=\"page-lead\">Every order placed with the account you're signed into — with live tracking, whenever you want it.</p>\n<div id=\"ordersApp\"></div>"
+  },
+  "rewards": {
+    nav: "Rewards", "kicker": "Nottera Rewards",
+    "title": "Welcome to the ritual.",
+    "body": "<p class=\"page-lead\">Nottera Rewards is our way of saying thank you — turn every good night into points and quiet perks.</p>\n<div id=\"rewardsBalance\"></div>\n<p class=\"page-actions\"><a class=\"btn-rewards-cta\" href=\"{{ routes.account_url }}\">Join Now</a><a class=\"btn-rewards-cta\" href=\"{{ routes.account_url }}\">Sign In</a></p>\n<h3>Ways to earn</h3>\n<div class=\"rewards-ways\"><div class=\"rewards-way\"><span class=\"rewards-way-value\">100 pts</span><span class=\"rewards-way-label\">Join the ritual</span></div><div class=\"rewards-way\"><span class=\"rewards-way-value\">2 pts</span><span class=\"rewards-way-label\">Every $1 spent</span></div><div class=\"rewards-way\"><span class=\"rewards-way-value\">20 pts</span><span class=\"rewards-way-label\">Visit us each week</span></div></div>\n<h3>Redeem your points</h3>\n<div class=\"rewards-redeem\"><div class=\"rewards-redeem-card\"><span class=\"rewards-redeem-off\">$5 off</span><span class=\"rewards-redeem-pts\">200 points</span></div><div class=\"rewards-redeem-card\"><span class=\"rewards-redeem-off\">$10 off</span><span class=\"rewards-redeem-pts\">400 points</span></div><div class=\"rewards-redeem-card\"><span class=\"rewards-redeem-off\">$25 off</span><span class=\"rewards-redeem-pts\">1,200 points</span></div></div>\n<blockquote><p>Better nights, and a bonus for every ritual you keep with us.</p></blockquote>\n<h3>Program terms</h3>\n<ul>\n<li>Nottera Rewards points have <strong>no cash value</strong> and cannot be sold, transferred, or redeemed for cash.</li>\n<li>Points are earned on the <strong>amount actually paid</strong> (after discounts, before shipping and tax) and are credited once an order is delivered and past the return window.</li>\n<li>If an order is <strong>returned or refunded</strong>, the points earned on that order are deducted from your balance, which may take your balance negative until your next earning event.</li>\n<li>Points <strong>expire after 12 months</strong> of account inactivity (no purchases, redemptions, or sign-in).</li>\n<li>We may <strong>change the earning rate or redemption values</strong> going forward, or end the program, with reasonable notice on this page; changes do not remove points you have already earned at the time of the change.</li>\n<li>We may suspend or close an account and forfeit its points for <strong>fraud, abuse, or violation of these Terms</strong> (e.g., fake accounts created to farm the welcome bonus).</li>\n<li>Rewards are unlocked once your Nottera account is created and become active after your first purchase.</li>\n</ul>\n<p class=\"page-muted\">See our <a href=\"#/terms\">Terms &amp; Conditions</a> for the rest of the rules that apply to your account and purchases.</p>"
+  },
+  "account": {
+    nav: "Account", "kicker": "Account",
+    "title": "Sign in or create your account.",
+    "body": "<p class=\"page-lead\">Your Nottera account keeps your orders, addresses and rewards points in one calm place.</p>\n<div id=\"accountApp\"></div>\n<h3>What your account unlocks</h3>\n<ul>\n<li><strong>Order history &amp; tracking</strong> — see every order and follow its tracking in one place.</li>\n<li><strong>Nottera Rewards</strong> — earn points on every purchase, for joining, and for visiting each week — then redeem them for discounts.</li>\n<li><strong>Early access</strong> — new launches and private sales before anyone else.</li>\n</ul>"
+  },
+  "about": {
+    nav: "Our Story", "kicker": "Our Story",
+    "title": "Better nights, by design.",
+    "body": "<p class=\"page-lead\">Some nights, everything finally softens — a mind slowing down, a body letting go. That feeling is the whole reason Nottera exists.</p>\n<p>We started Nottera because rest had quietly become the thing we all sacrificed first. The world got louder and faster, and our nights paid for it. We wanted to build something small and considered that gives a little of that calm back — starting with the one thing you touch for a third of your life.</p>\n<h3>The problem we couldn't ignore</h3>\n<p>Most pillows flatten by 2am, run hot, or leave your neck aching by morning. Sleep — the foundation of how we feel, think and show up — was being treated as an afterthought. We thought it deserved better than a rectangle of foam and a marketing promise.</p>\n<h3>One pillow, shaped around you</h3>\n<p>So we designed the Nottera Pillow around the body instead of around trends: a contoured, ergonomic shape that cradles the head, opens the shoulders and keeps your spine aligned in every sleeping position. Breathable materials that stay cool. Two sizes — Crescent and Eclipse — so every sleeper finds their fit, no guesswork, no compromise.</p>\n<h3>What we believe</h3>\n<ul>\n<li><strong>Rest isn't a luxury.</strong> It's the quiet foundation of a better day — and everyone deserves it.</li>\n<li><strong>Quiet quality over hype.</strong> We'd rather make one thing exceptionally well than a hundred things loudly.</li>\n<li><strong>Honesty in the details.</strong> Clear policies, a 3-year warranty, and a promise to make things right. No fine-print games.</li>\n</ul>\n<blockquote><p>A calmer tomorrow begins tonight.</p></blockquote>\n<p>We're a young brand, and we'd rather earn your trust one night at a time than promise you a crowd that isn't there yet. That's what the 60-night trial is for — if your nights have felt harder than they should, we'd love for you to feel the difference for yourself.</p>\n<p class=\"page-actions\"><a class=\"btn btn-primary\" href=\"#/pillow\">Discover Nottera</a></p>\n<p class=\"page-signature\">With care,<br>The Nottera team</p>"
+  },
+END_PT4_TEST
