@@ -1,0 +1,1896 @@
+ closeDrawer() {
+    overlay.classList.remove('open');
+    drawer.classList.remove('open');
+    drawer.setAttribute('aria-hidden', 'true');
+    document.body.style.overflow = '';
+    setTimeout(() => { overlay.hidden = true; }, 650);
+  }
+  toggle.addEventListener('click', openDrawer);
+  closeBtn.addEventListener('click', closeDrawer);
+  overlay.addEventListener('click', closeDrawer);
+  addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && drawer.classList.contains('open')) closeDrawer();
+  });
+
+  /* ---- quantity changes (event delegation) ---- */
+  itemsEl.addEventListener('click', (e) => {
+    const btn = e.target.closest('button[data-action]');
+    if (!btn) return;
+    const item = items.find((i) => i.key === btn.dataset.key);
+    if (!item) return;
+    if (btn.dataset.action === 'inc') item.qty += 1;
+    if (btn.dataset.action === 'dec') item.qty -= 1;
+    items = items.filter((i) => i.qty > 0);
+    save();
+    render();
+  });
+
+  /* ---- checkout: Shopify cart permalink ----
+     Builds /cart/{variantId}:{qty},... and lets Shopify's own cart + checkout
+     take over from there (real payment, address, guest checkout). Real
+     Shopify variant IDs, mapped from each cart line's product id + the
+     colour named in its free-text variant label (pillowcases carry both
+     a size and a colour; the pillow only has a size). 'guide' is a $0
+     gift-with-purchase line in this UI but a real $29.99 product in
+     Shopify, so it's deliberately excluded from checkout — sending it
+     would charge the customer for something shown as free. */
+  const VARIANT_IDS = {
+    pillowcrescent: 56851707429204,
+    pilloweclipse: 56851707461972,
+    casecrescent: { moonlight: 56850855461204, nebula: 56850855493972, polaris: 56850855526740, aurora: 56850855657812, venus: 56850855723348 },
+    caseeclipse: { moonlight: 56850855559508, nebula: 56850855592276, polaris: 56850855625044, aurora: 56850855690580, venus: 56850855756116 }
+  };
+  function resolveVariantId(item) {
+    const v = VARIANT_IDS[item.id];
+    if (!v) return null;
+    if (typeof v === 'number') return v;
+    const text = (item.variant || '').toLowerCase();
+    const colors = ['moonlight', 'nebula', 'polaris', 'aurora', 'venus'];
+    const found = colors.find((c) => text.indexOf(c) !== -1);
+    return v[found || 'moonlight'];
+  }
+  /* Adds every line via /cart/add.js (AJAX) then sends the browser straight to
+     /checkout — never through Shopify's native /cart page. That page has its
+     own generic Dawn header and doesn't match the site, so it's skipped
+     entirely rather than shown as a stop on the way to paying. */
+  async function goToCheckout(extraQuery) {
+    const parts = items
+      .map((i) => { const vid = resolveVariantId(i); return vid ? { id: vid, quantity: i.qty } : null; })
+      .filter(Boolean);
+    if (!parts.length) return;
+    // Bundle discounts shown on-site (Eos Set 15%, Nocturne Set 20%, and the
+    // buy-more-save-more volume tiers) are backed by real Shopify discount
+    // codes — auto-apply whichever one matches so the price the customer
+    // sees in the drawer is the price they actually pay at checkout.
+    const bundleCode = items.some((i) => i.dealNote && i.dealNote.includes('Nottera Eos Set'))
+      ? 'EOS15'
+      : items.some((i) => i.dealNote && i.dealNote.includes('Nottera Nocturne Set'))
+      ? 'NOCTURNE20'
+      : items.some((i) => i.dealNote && i.dealNote.includes('Volume · 15% off'))
+      ? 'VOL15'
+      : items.some((i) => i.dealNote && i.dealNote.includes('Volume · 10% off'))
+      ? 'VOL10'
+      : null;
+    try {
+      // Shopify's real cart persists across visits via a cookie. Without this,
+      // every checkout attempt ADDS on top of whatever a previous attempt
+      // already put there, so the real cart silently drifts out of sync with
+      // what this drawer shows — clearing first guarantees the real cart is
+      // always an exact mirror of the on-screen cart, nothing more.
+      await fetch('/cart/clear.js', { method: 'POST', credentials: 'same-origin' });
+      const addRes = await fetch('/cart/add.js', {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ items: parts })
+      });
+      // A failed add (e.g. a variant that's unavailable) leaves the real cart
+      // empty after the clear() above — redirecting to /checkout with nothing
+      // in it just bounces the customer straight back to the homepage with no
+      // explanation. Catch that here instead of silently sending them into it.
+      if (!addRes.ok) {
+        const err = await addRes.json().catch(() => ({}));
+        console.error('Nottera cart add failed:', addRes.status, err);
+        showToast((err && err.description) || 'Something went wrong adding your items — please try again.');
+        return;
+      }
+    } catch (e) {
+      console.error('Nottera cart add failed:', e);
+      showToast('Something went wrong adding your items — please try again.');
+      return;
+    }
+    const qs = [];
+    if (bundleCode) qs.push('discount=' + bundleCode);
+    if (extraQuery) qs.push(extraQuery);
+    window.location.href = '/checkout' + (qs.length ? '?' + qs.join('&') : '');
+  }
+  /* Demo order record for "My Orders" — real order data will come from
+     Shopify's order confirmation / Customer Account API once this is live. */
+  function orderSnapshot() {
+    return items.map((i) => ({ name: PRODUCTS[i.id].name, variant: i.variant || '', qty: i.qty, price: priceOf(i) }));
+  }
+  drawer.querySelector('.cart-checkout').addEventListener('click', () => {
+    if (!items.length) return;
+    const total = items.reduce((n, i) => n + i.qty * priceOf(i), 0);
+    window.NotteraAccount?.creditPurchasePoints(total);
+    window.NotteraAccount?.recordOrder(orderSnapshot(), total);
+    goToCheckout();
+  });
+  /* PayPal Express: same underlying checkout link, swap for the real PayPal
+     Express Checkout / Smart Buttons SDK once this is on Shopify (Shopify
+     surfaces PayPal automatically as an accelerated checkout button). */
+  drawer.querySelector('.cart-paypal').addEventListener('click', () => {
+    if (!items.length) return;
+    const total = items.reduce((n, i) => n + i.qty * priceOf(i), 0);
+    window.NotteraAccount?.creditPurchasePoints(total);
+    window.NotteraAccount?.recordOrder(orderSnapshot(), total);
+    goToCheckout('payment=paypal');
+  });
+  /* Apple Pay: same underlying checkout link, swap for the real Apple Pay
+     JS API / Shopify's native Apple Pay button once this is on Shopify. */
+  drawer.querySelector('.cart-applepay').addEventListener('click', () => {
+    if (!items.length) return;
+    const total = items.reduce((n, i) => n + i.qty * priceOf(i), 0);
+    window.NotteraAccount?.creditPurchasePoints(total);
+    window.NotteraAccount?.recordOrder(orderSnapshot(), total);
+    goToCheckout('payment=apple_pay');
+  });
+
+  /* ---- render ---- */
+  function render() {
+    const count = items.reduce((n, i) => n + i.qty, 0);
+    const total = items.reduce((n, i) => n + i.qty * priceOf(i), 0);
+
+    countEl.hidden = count === 0;
+    countEl.textContent = count;
+    emptyEl.hidden = count > 0;
+    footEl.hidden = count === 0;
+    totalEl.textContent = money(total);
+    if (financeEl) financeEl.textContent = 'or 4 interest-free payments of ' + money(total / 4) + ' with Shop Pay';
+    if (pointsEl) pointsEl.textContent = count > 0 ? `Check out now and earn ${Math.round(total * 2)} Nottera Rewards points` : '';
+
+    itemsEl.innerHTML = items.map((i) => {
+      if (i.id === 'guide') {
+        return `
+      <li class="cart-item cart-item-gift">
+        <div class="cart-item-info">
+          <h5>${PRODUCTS[i.id].name}</h5>
+          <p class="cart-line-note gold">Free gift · unlocked on this order</p>
+        </div>
+        <span class="cart-item-price"><span class="cart-item-free">FREE</span></span>
+      </li>`;
+      }
+      const hasDeal = typeof i.dealPrice === 'number';
+      const active = dealActive(i);
+      const dealNote = hasDeal
+        ? (active
+            ? `<p class="cart-line-note gold">${i.dealNote || ('Bundle price · $' + (PRODUCTS[i.id].price - i.dealPrice).toFixed(0) + ' off')}</p>`
+            : (i.dealRequires
+                ? `<p class="cart-line-note warn">Add ${(Array.isArray(i.dealRequires) ? i.dealRequires : [i.dealRequires]).map((rid) => PRODUCTS[rid].name).join(' + ')} to unlock $${(PRODUCTS[i.id].price - i.dealPrice).toFixed(0)} off</p>`
+                : `<p class="cart-line-note warn">Add ${i.dealMinQty - i.qty} more to unlock $${(PRODUCTS[i.id].price - i.dealPrice).toFixed(0)} off each</p>`))
+        : '';
+      const note = (i.variant ? `<p>${i.variant}</p>` : '') + dealNote;
+      return `
+      <li class="cart-item">
+        <div class="cart-item-info">
+          <h5>${PRODUCTS[i.id].name}</h5>
+          ${note}
+        </div>
+        <div class="cart-item-qty">
+          <button data-action="dec" data-key="${i.key}" aria-label="Decrease quantity">−</button>
+          <span>${i.qty}</span>
+          <button data-action="inc" data-key="${i.key}" aria-label="Increase quantity">+</button>
+        </div>
+        <span class="cart-item-price">
+          ${active ? `<span class="cart-item-was">${money(i.qty * PRODUCTS[i.id].price)}</span>` : ''}
+          ${money(i.qty * priceOf(i))}
+        </span>
+      </li>`;
+    }).join('');
+
+    renderUpsell();
+  }
+
+  /* ---- cross-sell / upsell: coherent by what's already in the cart ----
+     Pillow only → suggest a matching pillowcase. Pillowcase only → suggest the
+     pillow in the SAME size. Both already present → invite a second colour.
+     No forced discount here — the goal is a sensible pairing, not a deal. */
+  function upsellCard(offer) {
+    const p = PRODUCTS[offer.id];
+    const isCase = /^case(crescent|eclipse)$/.test(offer.id);
+    const isPillow = /^pillow(crescent|eclipse)$/.test(offer.id);
+    const img = isCase ? ((window.NOTTERA_CASE_HERO || {}).moonlight || p.img)
+      : isPillow ? ((window.NOTTERA_PILLOW_HERO || {})[offer.id.replace('pillow', '')] || p.img)
+      : p.img;
+    return `
+      <p class="cart-upsell-head">${offer.tag}</p>
+      <div class="cart-upsell-card">
+        <img src="${img}" alt="" loading="lazy">
+        <div class="cart-upsell-info">
+          <h6>${p.name}</h6>
+          <p>${offer.line}</p>
+          <span class="cart-upsell-price">${money(p.price)}</span>
+        </div>
+        <button class="cart-upsell-add" type="button" data-add="${offer.id}" data-variant="${offer.variant}" aria-label="Add ${p.name}">Add +</button>
+      </div>`;
+  }
+  function pickUpsell() {
+    const pillowItem = items.find((i) => i.id === 'pillowcrescent' || i.id === 'pilloweclipse');
+    const caseItem = items.find((i) => /^case(crescent|eclipse)$/.test(i.id));
+    const sizeOf = (i) => (/eclipse/.test(i.id) ? 'eclipse' : 'crescent');
+    const sizeName = (k) => (k === 'eclipse' ? 'Eclipse' : 'Crescent');
+
+    if (pillowItem && !caseItem) {
+      const size = sizeOf(pillowItem), id = 'case' + size;
+      return { id, variant: `Ice-Silk · Moonlight · ${sizeName(size)}`, tag: 'Complete your set',
+        line: `Add an ice-silk pillowcase in ${sizeName(size)} to match your pillow.` };
+    }
+    if (caseItem && !pillowItem) {
+      const size = sizeOf(caseItem), id = 'pillow' + size;
+      return { id, variant: `Nottera Pillow · ${sizeName(size)}`, tag: 'Complete your set',
+        line: `Add the Nottera Pillow in ${sizeName(size)} to match your pillowcase.` };
+    }
+    return null;
+  }
+  function renderUpsell() {
+    if (!upsellEl) return;
+    if (items.length === 0) { upsellEl.hidden = true; upsellEl.innerHTML = ''; return; }
+    const offer = pickUpsell();
+    if (!offer) { upsellEl.hidden = true; upsellEl.innerHTML = ''; return; }
+    upsellEl.hidden = false;
+    upsellEl.innerHTML = upsellCard(offer);
+  }
+  upsellEl?.addEventListener('click', (e) => {
+    const btn = e.target.closest('[data-add]');
+    if (!btn) return;
+    addItem(btn.dataset.add, btn.dataset.variant || '', 1, null);
+    showToast(PRODUCTS[btn.dataset.add].name + ' added to your night');
+  });
+
+  function showToast(message) {
+    toast.textContent = message;
+    toast.classList.add('show');
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => toast.classList.remove('show'), 3200);
+  }
+
+  function load() {
+    try {
+      const raw = localStorage.getItem(STORAGE_KEY);
+      const parsed = raw ? JSON.parse(raw) : [];
+      return Array.isArray(parsed)
+        ? parsed.filter((i) => PRODUCTS[i.id] && i.qty > 0)
+        : [];
+    } catch {
+      return [];
+    }
+  }
+  function save() {
+    try { localStorage.setItem(STORAGE_KEY, JSON.stringify(items)); } catch {}
+  }
+
+  /* ---- public API (used by the product pages; maps to Shopify cart later) ---- */
+  window.NotteraCart = {
+    add(id, variant = '', qty = 1, deal = null) {
+      addItem(id, variant, qty, deal);
+      const p = PRODUCTS[id];
+      if (p && id !== 'guide') showToast(p.name + (variant ? ' · ' + variant : '') + ' added to your night');
+    },
+    remove(id) {
+      const idx = items.findIndex((i) => i.id === id);
+      if (idx > -1) { items.splice(idx, 1); save(); render(); }
+    },
+    getTotal() { return items.reduce((n, i) => (i.id === 'guide' ? n : n + i.qty * priceOf(i)), 0); },
+    open: openDrawer,
+    catalog: PRODUCTS
+  };
+
+  render();
+}
+
+/* Scroll-driven scene behaviours:
+   - Discover: one fixed frame whose image and caption change per step.
+   - Materials: the macro photograph zooms slowly while scrolling.
+   - Goodnight: newsletter submit feedback. */
+function initScenes() {
+  initDiscover();
+  initMacroZoom();
+  initReviews();
+  initNewsletter();
+}
+
+const clampR = (x, a = 0, b = 1) => Math.min(b, Math.max(a, x));
+
+/* Reviews: vertical scroll through the pinned section pans the rail sideways,
+   revealing the rest of the cards. Falls back to a normal swipe row on small
+   screens / reduced motion. */
+function initReviews() {
+  const summaryEl = document.getElementById('ratingSummary');
+  const cardsEl = document.getElementById('reviewsCards');
+  if (!summaryEl && !cardsEl) return;
+
+  /* ---- rating summary + review cards + "Write a Review" ----
+     TODO(shopify): once a real reviews app (Judge.me / Loox) is connected
+     and orders exist, swap SEED and REVIEWS below for that app's live data. */
+  const PENDING_KEY = 'notterra-pending-reviews';
+  const SEED = {}; // honest: no fabricated ratings — wire to Judge.me's real review data once orders exist
+  const REVIEWS = []; // honest: no fabricated testimonials — wire to Judge.me's real review data once orders exist
+
+  function savePendingReview(r) {
+    try {
+      const raw = localStorage.getItem(PENDING_KEY);
+      const list = raw ? JSON.parse(raw) : [];
+      list.push(r);
+      localStorage.setItem(PENDING_KEY, JSON.stringify(list));
+    } catch {}
+  }
+
+  function starString(n) {
+    return `<span class="social-stars-fill" style="position:static;overflow:visible;display:inline">${'★'.repeat(n)}</span>${'☆'.repeat(5 - n)}`;
+  }
+
+  function renderSummary() {
+    if (!summaryEl) return;
+    const total = Object.values(SEED).reduce((a, b) => a + b, 0);
+    if (!total) {
+      summaryEl.innerHTML = `
+        <div class="rating-summary-main rating-summary-empty">
+          <span class="rating-empty-text">We're brand new — no reviews yet. Your 60-night trial is the real guarantee.</span>
+        </div>
+        <button class="btn write-review-btn" type="button" id="writeReviewBtn">Write a Review</button>`;
+      document.getElementById('writeReviewBtn').addEventListener('click', openReviewModal);
+      return;
+    }
+    const weighted = Object.entries(SEED).reduce((a, [s, c]) => a + Number(s) * c, 0);
+    const avg = (weighted / total).toFixed(1);
+    const bars = [5, 4, 3, 2, 1].map((n) => {
+      const count = SEED[n];
+      const pct = Math.round((count / total) * 100);
+      return `<div class="rating-bar-row">
+        <span class="rating-bar-label">${n} star</span>
+        <span class="rating-bar-track"><span class="rating-bar-fill" style="width:${pct}%"></span></span>
+        <span class="rating-bar-count">${count}</span>
+      </div>`;
+    }).join('');
+    summaryEl.innerHTML = `
+      <div class="rating-summary-main">
+        <span class="rating-big">${avg}</span>
+        <span class="social-stars">${starString(Math.round(avg))}</span>
+        <span class="rating-count">${total} reviews</span>
+      </div>
+      <div class="rating-bars">${bars}</div>
+      <button class="btn write-review-btn" type="button" id="writeReviewBtn">Write a Review</button>`;
+    document.getElementById('writeReviewBtn').addEventListener('click', openReviewModal);
+  }
+
+  function renderCards() {
+    if (!cardsEl) return;
+    cardsEl.innerHTML = REVIEWS.map((r) => `
+      <div class="review-card">
+        <span class="social-stars">${starString(r.stars)}</span>
+        <p class="review-card-text">&ldquo;${r.text}&rdquo;</p>
+        <p class="review-card-person">${r.name} &middot; ${r.place}</p>
+      </div>`).join('');
+  }
+  // If REVIEWS is empty (current honest default), cardsEl.innerHTML above resolves to '' — no fabricated cards render.
+
+  // Modal (built once, reused)
+  const modal = document.createElement('div');
+  modal.className = 'popup-overlay';
+  modal.innerHTML = `
+    <div class="popup review-modal" role="dialog" aria-modal="true" aria-labelledby="reviewModalTitle">
+      <button class="popup-close" type="button" aria-label="Close">&times;</button>
+      <p class="popup-kicker">Share your night</p>
+      <h3 id="reviewModalTitle">Write a review</h3>
+      <div class="review-star-picker" role="radiogroup" aria-label="Your rating">
+        ${[1, 2, 3, 4, 5].map((n) => `<button type="button" data-star="${n}" aria-label="${n} star${n > 1 ? 's' : ''}">★</button>`).join('')}
+      </div>
+      <form class="popup-form review-form" novalidate>
+        <input type="text" class="popup-input" name="name" placeholder="Your name" maxlength="40" required>
+        <textarea class="popup-input review-textarea" name="text" placeholder="Tell us about your nights with Nottera..." maxlength="400" rows="4" required></textarea>
+        <button type="submit" class="btn btn-primary popup-submit">Submit review</button>
+      </form>
+      <p class="popup-success review-success" hidden>Thank you — your review has been submitted and will appear once our team reviews it.</p>
+    </div>`;
+  document.body.appendChild(modal);
+
+  const picker = modal.querySelector('.review-star-picker');
+  const form = modal.querySelector('.review-form');
+  const successEl = modal.querySelector('.review-success');
+  let selectedStars = 0;
+
+  picker.querySelectorAll('button').forEach((b) => b.addEventListener('click', () => {
+    selectedStars = Number(b.dataset.star);
+    picker.querySelectorAll('button').forEach((x) => x.classList.toggle('on', Number(x.dataset.star) <= selectedStars));
+  }));
+
+  function resetModal() {
+    form.reset();
+    form.hidden = false;
+    form.classList.remove('invalid');
+    picker.hidden = false;
+    picker.querySelectorAll('button').forEach((x) => x.classList.remove('on'));
+    selectedStars = 0;
+    successEl.hidden = true;
+  }
+  function openReviewModal() {
+    resetModal();
+    modal.classList.add('open');
+    document.body.style.overflow = 'hidden';
+  }
+  function closeReviewModal() {
+    modal.classList.remove('open');
+    document.body.style.overflow = '';
+  }
+  modal.querySelector('.popup-close').addEventListener('click', closeReviewModal);
+  modal.addEventListener('click', (e) => { if (e.target === modal) closeReviewModal(); });
+  addEventListener('keydown', (e) => { if (e.key === 'Escape' && modal.classList.contains('open')) closeReviewModal(); });
+
+  form.addEventListener('submit', (e) => {
+    e.preventDefault();
+    const name = form.name.value.trim();
+    const text = form.text.value.trim();
+    if (!name || !text || !selectedStars) {
+      form.classList.add('invalid');
+      form.name.classList.toggle('error', !name);
+      form.text.classList.toggle('error', !text);
+      return;
+    }
+    // Goes to the private pending queue only — never published automatically.
+    savePendingReview({ name, text, stars: selectedStars, ts: Date.now() });
+
+    form.hidden = true;
+    picker.hidden = true;
+    successEl.hidden = false;
+    setTimeout(closeReviewModal, 2200);
+  });
+  form.name.addEventListener('input', () => form.name.classList.remove('error'));
+  form.text.addEventListener('input', () => form.text.classList.remove('error'));
+
+  renderSummary();
+  renderCards();
+}
+
+function initDiscover() {
+  const track = document.getElementById('discoverTrack');
+  if (!track) return;
+  const images = track.querySelectorAll('[data-step-img]');
+  const captions = track.querySelectorAll('[data-step-caption]');
+
+  function activate(step) {
+    images.forEach((el) => el.classList.toggle('active', el.dataset.stepImg === step));
+    captions.forEach((el) => el.classList.toggle('active', el.dataset.stepCaption === step));
+  }
+
+  const io = new IntersectionObserver((entries) => {
+    for (const entry of entries) {
+      if (entry.isIntersecting) activate(entry.target.dataset.step);
+    }
+  }, { rootMargin: '-45% 0px -45% 0px' });
+
+  track.querySelectorAll('.discover-step').forEach((el) => io.observe(el));
+}
+
+function initMacroZoom() {
+  const img = document.getElementById('macroZoom');
+  if (!img) return;
+  if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) return;
+  let ticking = false;
+
+  function update() {
+    const rect = img.parentElement.getBoundingClientRect();
+    if (rect.bottom < 0 || rect.top > innerHeight) return;
+    // 0 when the frame enters from below, 1 when it leaves above.
+    const progress = 1 - (rect.bottom / (innerHeight + rect.height));
+    const zoom = 1 + Math.min(1, Math.max(0, progress)) * 0.18;
+    img.style.setProperty('--macro-zoom', zoom.toFixed(4));
+    img.style.transform = `scale(${zoom.toFixed(4)})`;
+  }
+
+  addEventListener('scroll', () => {
+    if (!ticking) {
+      requestAnimationFrame(() => { update(); ticking = false; });
+      ticking = true;
+    }
+  }, { passive: true });
+  update();
+}
+
+/* Shared real Klaviyo subscribe call — used by every email-capture form on
+   the site (exit-intent popup, footer newsletter, Journal signup). */
+function notteraKlaviyoSubscribe(email) {
+  return fetch('https://a.klaviyo.com/client/subscriptions?company_id=YApgMC', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/vnd.api+json',
+      'revision': '2024-10-15'
+    },
+    body: JSON.stringify({
+      data: {
+        type: 'subscription',
+        attributes: {
+          profile: {
+            data: {
+              type: 'profile',
+              attributes: {
+                email: email,
+                subscriptions: {
+                  email: { marketing: { consent: 'SUBSCRIBED' } }
+                }
+              }
+            }
+          }
+        },
+        relationships: {
+          list: { data: { type: 'list', id: 'Uqidh7' } }
+        }
+      }
+    })
+  }).catch(function(err){ console.error('Klaviyo subscribe failed:', err); });
+}
+
+function initNewsletter() {
+  const form = document.getElementById('newsletter');
+  if (!form) return;
+  const toast = document.getElementById('toast');
+
+  form.addEventListener('submit', (e) => {
+    e.preventDefault();
+    const email = form.email.value.trim();
+    const valid = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
+    toast.textContent = valid
+      ? 'Welcome to calmer nights. Check your inbox soon.'
+      : 'Please enter a valid email address.';
+    toast.classList.add('show');
+    setTimeout(() => toast.classList.remove('show'), 3200);
+    if (valid) { form.reset(); notteraKlaviyoSubscribe(email); }
+  });
+}
+
+/* In-site legal & policy pages. Footer links route to #/slug; each opens an
+   overlay "page" that shares the site's palette and type over the night sky.
+   Content is the public policy text; brand-aesthetic styles live in styles.css. */
+
+const PAGES = {
+  "pillow": {
+    nav: "Pillows", "kicker": "Pillow",
+    "title": "The Nottera Pillow.",
+    "body": "<div id=\"pillowRoot\"></div>"
+  },
+  "bed": {
+    nav: "Bedding", "kicker": "Pillow Bedding",
+    "title": "Pillowcases.",
+    "body": "<div id=\"bedRoot\"></div>"
+  },
+  "bundles": {
+    nav: "Bundles & Sets", "kicker": "Bundles & Sets",
+    "title": "Buy the ritual together.",
+    "body": "<div id=\"bundlesRoot\"></div>"
+  },
+  "orders": {
+    nav: "My Orders", "kicker": "Account",
+    "title": "My Orders.",
+    "body": "<p class=\"page-lead\">Every order placed with the account you're signed into — with live tracking, whenever you want it.</p>\n<div id=\"ordersApp\"></div>"
+  },
+  "rewards": {
+    nav: "Rewards", "kicker": "Nottera Rewards",
+    "title": "Welcome to the ritual.",
+    "body": "<p class=\"page-lead\">Nottera Rewards is our way of saying thank you — turn every good night into points and quiet perks.</p>\n<div id=\"rewardsBalance\"></div>\n<p class=\"page-actions\"><a class=\"btn-rewards-cta\" href=\"{{ routes.account_url }}\">Join Now</a><a class=\"btn-rewards-cta\" href=\"{{ routes.account_url }}\">Sign In</a></p>\n<h3>Ways to earn</h3>\n<div class=\"rewards-ways\"><div class=\"rewards-way\"><span class=\"rewards-way-value\">100 pts</span><span class=\"rewards-way-label\">Join the ritual</span></div><div class=\"rewards-way\"><span class=\"rewards-way-value\">2 pts</span><span class=\"rewards-way-label\">Every $1 spent</span></div><div class=\"rewards-way\"><span class=\"rewards-way-value\">20 pts</span><span class=\"rewards-way-label\">Visit us each week</span></div></div>\n<h3>Redeem your points</h3>\n<div class=\"rewards-redeem\"><div class=\"rewards-redeem-card\"><span class=\"rewards-redeem-off\">$5 off</span><span class=\"rewards-redeem-pts\">200 points</span></div><div class=\"rewards-redeem-card\"><span class=\"rewards-redeem-off\">$10 off</span><span class=\"rewards-redeem-pts\">400 points</span></div><div class=\"rewards-redeem-card\"><span class=\"rewards-redeem-off\">$25 off</span><span class=\"rewards-redeem-pts\">1,200 points</span></div></div>\n<blockquote><p>Better nights, and a bonus for every ritual you keep with us.</p></blockquote>\n<h3>Program terms</h3>\n<ul>\n<li>Nottera Rewards points have <strong>no cash value</strong> and cannot be sold, transferred, or redeemed for cash.</li>\n<li>Points are earned on the <strong>amount actually paid</strong> (after discounts, before shipping and tax) and are credited once an order is delivered and past the return window.</li>\n<li>If an order is <strong>returned or refunded</strong>, the points earned on that order are deducted from your balance, which may take your balance negative until your next earning event.</li>\n<li>Points <strong>expire after 12 months</strong> of account inactivity (no purchases, redemptions, or sign-in).</li>\n<li>We may <strong>change the earning rate or redemption values</strong> going forward, or end the program, with reasonable notice on this page; changes do not remove points you have already earned at the time of the change.</li>\n<li>We may suspend or close an account and forfeit its points for <strong>fraud, abuse, or violation of these Terms</strong> (e.g., fake accounts created to farm the welcome bonus).</li>\n<li>Rewards are unlocked once your Nottera account is created and become active after your first purchase.</li>\n</ul>\n<p class=\"page-muted\">See our <a href=\"#/terms\">Terms &amp; Conditions</a> for the rest of the rules that apply to your account and purchases.</p>"
+  },
+  "account": {
+    nav: "Account", "kicker": "Account",
+    "title": "Sign in or create your account.",
+    "body": "<p class=\"page-lead\">Your Nottera account keeps your orders, addresses and rewards points in one calm place.</p>\n<div id=\"accountApp\"></div>\n<h3>What your account unlocks</h3>\n<ul>\n<li><strong>Order history &amp; tracking</strong> — see every order and follow its tracking in one place.</li>\n<li><strong>Nottera Rewards</strong> — earn points on every purchase, for joining, and for visiting each week — then redeem them for discounts.</li>\n<li><strong>Early access</strong> — new launches and private sales before anyone else.</li>\n</ul>"
+  },
+  "about": {
+    nav: "Our Story", "kicker": "Our Story",
+    "title": "Better nights, by design.",
+    "body": "<p class=\"page-lead\">Some nights, everything finally softens — a mind slowing down, a body letting go. That feeling is the whole reason Nottera exists.</p>\n<p>We started Nottera because rest had quietly become the thing we all sacrificed first. The world got louder and faster, and our nights paid for it. We wanted to build something small and considered that gives a little of that calm back — starting with the one thing you touch for a third of your life.</p>\n<h3>The problem we couldn't ignore</h3>\n<p>Most pillows flatten by 2am, run hot, or leave your neck aching by morning. Sleep — the foundation of how we feel, think and show up — was being treated as an afterthought. We thought it deserved better than a rectangle of foam and a marketing promise.</p>\n<h3>One pillow, shaped around you</h3>\n<p>So we designed the Nottera Pillow around the body instead of around trends: a contoured, ergonomic shape that cradles the head, opens the shoulders and keeps your spine aligned in every sleeping position. Breathable materials that stay cool. Two sizes — Crescent and Eclipse — so every sleeper finds their fit, no guesswork, no compromise.</p>\n<h3>What we believe</h3>\n<ul>\n<li><strong>Rest isn't a luxury.</strong> It's the quiet foundation of a better day — and everyone deserves it.</li>\n<li><strong>Quiet quality over hype.</strong> We'd rather make one thing exceptionally well than a hundred things loudly.</li>\n<li><strong>Honesty in the details.</strong> Clear policies, a 3-year warranty, and a promise to make things right. No fine-print games.</li>\n</ul>\n<blockquote><p>A calmer tomorrow begins tonight.</p></blockquote>\n<p>We're a young brand, and we'd rather earn your trust one night at a time than promise you a crowd that isn't there yet. That's what the 60-night trial is for — if your nights have felt harder than they should, we'd love for you to feel the difference for yourself.</p>\n<p class=\"page-actions\"><a class=\"btn btn-primary\" href=\"#/pillow\">Discover Nottera</a></p>\n<p class=\"page-signature\">With care,<br>The Nottera team</p>"
+  },
+  "firstnight": {
+    "kicker": "Welcome",
+    "title": "Your first night.",
+    "body": "<p class=\"page-lead\">You just opened the box. Here's what to do before you sleep on it.</p>\n<h3>1. Unwrap it flat</h3>\n<p>Let the pillow breathe for 20&ndash;30 minutes out of its packaging before you use it &mdash; it's compressed for shipping and needs a little time to come back to full loft.</p>\n<h3>2. Find your side</h3>\n<p>Every Nottera pillow has two heights in one: a higher side and a lower side. Tonight, try the higher side first if you sleep on your side or have broader shoulders; the lower side if you sleep on your back or stomach. If it's not right, flip it &mdash; we call this the <strong>Phase Flip</strong>, and most people do it at least once before they find their side.</p>\n<h3>3. Give it more than one night</h3>\n<p>Memory foam softens to your shape over the first several nights. Don't judge it on night one &mdash; you've got <strong>60 nights</strong> to decide either way, so there's no rush.</p>\n<h3>4. Start the 7-Night Reset</h3>\n<p>Inside your order (or in <a href=\"#guide\">the Nottera Sleep Guide</a>, free over $100) is the <strong>7-Night Reset</strong> &mdash; one small, research-backed change per night for a week. Most people notice a difference by night four.</p>\n<h3>5. Keep the card</h3>\n<p>The card in your box has a QR code back to this page, so you can find it again on night two, three, or thirty. Scan it, bookmark it, whatever's easiest.</p>\n<blockquote><p>Welcome to the Nocturne &mdash; we're glad you're here.</p></blockquote>\n<p class=\"page-actions\"><a class=\"btn btn-primary\" href=\"#/journal\">Read the Journal</a></p>"
+  },
+  "terms": {
+    nav: "Terms of Service", "kicker": "Legal",
+    "title": "Terms of Service",
+    "body": "<p><strong>Last updated: July 2026</strong></p>\n<h3>1.1 Agreement</h3>\n<p>These Terms of Service (\"Terms\") govern your access to and use of mynottera.com and any purchase you\nmake from Nottera. By using the site or placing an order, you agree to these Terms, our Privacy\nPolicy, and the other policies referenced here. If you do not agree, please do not use the site or\npurchase.</p>\n<h3>1.2 Eligibility</h3>\n<p>You must be at least 18 years old and able to form a binding contract. By ordering, you represent\nthat you meet these requirements and that the information you provide is accurate and complete.</p>\n<h3>1.3 Accounts</h3>\n<p>If you create an account, you are responsible for keeping your credentials confidential and for all\nactivity under your account. Notify us immediately of any unauthorized use.</p>\n<h3>1.4 Orders, acceptance, and cancellation</h3>\n<ul>\n<li>\n<p>Your order is an <strong>offer to buy</strong>. A contract is formed only when we send an order or shipping\n  confirmation. We may <strong>accept, decline, limit, or cancel</strong> any order, in whole or in part, for any\n  lawful reason.</p>\n</li>\n<li>\n<p>We may cancel or refuse orders that appear <strong>fraudulent, abusive, placed for resale, unusually\n  large, or that fail payment or identity verification</strong>. If we cancel a paid order, we refund the\n  amount charged for the cancelled items.</p>\n</li>\n<li>\n<p>We may <strong>limit quantities</strong> per person, household, or order.</p>\n</li>\n</ul>\n<h3>1.5 Pricing and errors</h3>\n<p>Prices are in <strong>US Dollars (USD)</strong> and may change at any time. Despite our efforts, products may\noccasionally be mispriced or described inaccurately. <strong>We reserve the right to correct errors and to\ncancel any affected order — even after it is confirmed or paid — and to issue a refund.</strong></p>\n<h3>1.6 Payment</h3>\n<p>By submitting payment information, you represent that you are authorized to use the payment method\nand authorize us and our payment processor to charge the total, including taxes and any shipping.\nSee our <strong>Payment Policy</strong> for details.</p>\n<h3>1.7 Product information; not a medical device</h3>\n<p>We aim to display products, colors, and specifications accurately, but we do not warrant that all\ncontent is error‑free, and actual colors may vary by screen. <strong>Nottera products are consumer comfort\nproducts, not medical devices.</strong> They are not intended to diagnose, treat, cure, or prevent any\nmedical condition. Descriptions of comfort, support, or \"ergonomics\" are general product information,\n<strong>not medical advice</strong>. Please consult a qualified healthcare professional for any medical need.</p>\n<h3>1.8 Reviews and user content</h3>\n<p>If you submit reviews, photos, or other content, you grant Nottera a non‑exclusive, worldwide,\nroyalty‑free, perpetual license to use, reproduce, and display that content for marketing and\noperations. You confirm the content is yours, accurate, and lawful. We may remove any content at our\ndiscretion.</p>\n<h3>1.9 Acceptable use</h3>\n<p>You agree not to: (a) use the site unlawfully or fraudulently; (b) interfere with its operation or\nsecurity; (c) scrape or use bots without permission; (d) infringe intellectual‑property rights;\n(e) resell products without authorization; or (f) misuse promotions, returns, or chargebacks.</p>\n<h3>1.10 Intellectual property</h3>\n<p>The site and all content, trademarks, logos, text, images, and designs are owned by or licensed to\nNottera and protected by law. You receive no rights except to view and purchase for personal use.</p>\n<h3>1.11 Third‑party links and services</h3>\n<p>The site may link to or rely on third parties (for example, payment and analytics). We are not\nresponsible for third‑party content or practices.</p>\n<h3>1.12 Disclaimer of warranties</h3>\n<p>Except for the express <strong>Limited Warranty</strong> in our Warranty Policy and any rights you have under\napplicable consumer‑protection law that cannot be waived, the site and products are provided <strong>\"as\nis\" and \"as available\"</strong>, without warranties of any kind, express or implied, including\nmerchantability, fitness for a particular purpose, and non‑infringement.</p>\n<h3>1.13 Limitation of liability</h3>\n<p>To the maximum extent permitted by law, Nottera will not be liable for any indirect, incidental,\nspecial, consequential, or punitive damages, or for lost profits, data, or goodwill. <strong>Our total\nliability for any claim will not exceed the amount you paid for the product(s) giving rise to the\nclaim.</strong> Nothing limits liability that cannot be limited by law.</p>\n<h3>1.14 Billing disputes and fair‑use</h3>\n<ul>\n<li>\n<p><strong>Billing questions:</strong> if you believe there is a billing problem, <strong>contact us first</strong> at\n  hello@mynottera.com — most issues are resolved within 24 hours. Filing a payment dispute in bad\n  faith (for example, after receiving the product, or in place of a return) is a breach of these\n  Terms. We may contest such disputes with evidence (including tracking and delivery confirmation),\n  recover amounts owed, and decline future service.</p>\n</li>\n<li>\n<p><strong>Return and promotion fair‑use:</strong> we may refuse or limit orders, returns, refunds, or discounts\n  where there is repeated, excessive, or bad‑faith activity, false claims, resale, or promotion\n  abuse.</p>\n</li>\n<li>\n<p><strong>Verification:</strong> we may require identity or payment verification and may cancel orders that\n  cannot be verified.</p>\n</li>\n</ul>\n<h3>1.15 Indemnification</h3>\n<p>You agree to indemnify and hold Nottera harmless from claims, damages, and expenses (including\nreasonable legal fees) arising from your breach of these Terms, misuse of the site, or violation of\nlaw or third‑party rights.</p>\n<h3>1.16 Dispute resolution; arbitration; class‑action waiver</h3>\n<p><strong>Please read carefully — this affects your legal rights.</strong></p>\n<ul>\n<li>\n<p><strong>Informal resolution first.</strong> Before any formal proceeding, you agree to contact us at\n  hello@mynottera.com and attempt to resolve the dispute informally for at least 30 days.</p>\n</li>\n<li>\n<p><strong>Binding arbitration.</strong> Any dispute not resolved informally will be resolved by <strong>binding\n  individual arbitration</strong> administered by the American Arbitration Association under its Consumer\n  Arbitration Rules, rather than in court, except that either party may bring an individual claim in\n  <strong>small‑claims court</strong>.</p>\n</li>\n<li>\n<p><strong>Class‑action waiver.</strong> Disputes are arbitrated <strong>only on an individual basis</strong>; you and Nottera\n  waive any right to participate in a class or representative action.</p>\n</li>\n<li>\n<p><strong>Opt‑out.</strong> You may opt out of arbitration within <strong>30 days</strong> of first accepting these Terms by\n  emailing hello@mynottera.com with your name, order/email, and a statement that you opt out.</p>\n</li>\n<li>\n<p><strong>Time limit.</strong> Any claim must be filed within <strong>one (1) year</strong> after it arises, to the extent\n  permitted by law.</p>\n</li>\n<li>\n<p>Where these provisions are not permitted, they do not apply to you.</p>\n</li>\n</ul>\n<h3>1.17 Governing law</h3>\n<p>These Terms are governed by the laws of the <strong>State in which Nottera is established</strong>, without regard to conflict\nof law rules, and subject to §1.16.</p>\n<h3>1.18 Changes</h3>\n<p>We may update these Terms at any time. Changes take effect when posted with a new \"Last updated\"\ndate. Continued use or purchase constitutes acceptance.</p>\n<h3>1.19 Force majeure</h3>\n<p>We are not liable for delays or failures caused by events beyond our reasonable control, including\nnatural disasters, war, strikes, carrier disruptions, customs actions, pandemics, or governmental\nmeasures.</p>\n<h3>1.20 Miscellaneous</h3>\n<p>If any provision is unenforceable, the rest remains in effect. Our failure to enforce a provision is\nnot a waiver. You may not assign these Terms; we may. These Terms and the policies referenced here\nare the entire agreement between you and Nottera.</p>\n<h3>1.21 Contact</h3>\n<p>Nottera — support@mynottera.com.</p>"
+  },
+  "privacy": {
+    nav: "Privacy Policy", "kicker": "Legal",
+    "title": "Privacy Policy",
+    "body": "<p><strong>Last updated: July 2026</strong></p>\n<p>Nottera respects your privacy. This Policy explains what personal information we collect, why, how we\nshare it, and your rights. It is designed to comply with the EU/UK <strong>GDPR</strong>, the California\n<strong>CCPA/CPRA</strong>, and other applicable US state privacy laws.</p>\n<h3>2.1 Who we are</h3>\n<p>Nottera, mailing address available on request, is responsible for your personal information. Privacy\ncontact: support@mynottera.com.</p>\n<h3>2.2 Information we collect</h3>\n<ul>\n<li><strong>Identifiers &amp; contact data:</strong> name, email, phone, shipping/billing address.</li>\n<li><strong>Order data:</strong> items purchased, order value, transaction history.</li>\n<li>\n<p><strong>Payment data:</strong> processed by our payment providers; <strong>we do not store full card numbers</strong>. We\n  receive only limited data (e.g., last 4 digits, authorization result).</p>\n</li>\n<li>\n<p><strong>Account data:</strong> login credentials (stored securely), preferences.</p>\n</li>\n<li><strong>Communications:</strong> emails, messages, reviews, support requests.</li>\n<li>\n<p><strong>Device &amp; usage data:</strong> IP address, browser/device type, pages viewed, and similar analytics data\n  collected via cookies (see Cookie Policy).</p>\n</li>\n<li>\n<p><strong>Marketing data:</strong> subscription status and engagement.</p>\n</li>\n</ul>\n<h3>2.3 Sources</h3>\n<p>Directly from you; automatically via cookies and similar technology; and from our service providers\n(such as payment, analytics, and fraud‑prevention providers).</p>\n<h3>2.4 How and why we use it (and GDPR legal bases)</h3>\n<table>\n<thead>\n<tr>\n<th>Purpose</th>\n<th>GDPR legal basis</th>\n</tr>\n</thead>\n<tbody>\n<tr>\n<td>Process and deliver orders; provide support</td>\n<td>Performance of a contract</td>\n</tr>\n<tr>\n<td>Send order and shipping updates</td>\n<td>Performance of a contract</td>\n</tr>\n<tr>\n<td>Prevent fraud and abuse; secure our systems</td>\n<td>Legitimate interests / legal obligation</td>\n</tr>\n<tr>\n<td>Marketing emails and offers</td>\n<td>Consent (and/or legitimate interests where permitted); opt out anytime</td>\n</tr>\n<tr>\n<td>Analytics and improving the site</td>\n<td>Consent (non‑essential cookies) / legitimate interests</td>\n</tr>\n<tr>\n<td>Comply with legal, tax, and accounting duties</td>\n<td>Legal obligation</td>\n</tr>\n</tbody>\n</table>\n<h3>2.5 How we share information</h3>\n<p>We share personal information only as needed to run our business:</p>\n<ul>\n<li>\n<p><strong>Order fulfillment and delivery:</strong> we share your <strong>name, shipping address, and order details</strong>\n  with the <strong>fulfillment and shipping providers</strong> (including carriers) that prepare and deliver your\n  order.</p>\n</li>\n<li>\n<p><strong>Payment processors</strong> (to take payment and help prevent fraud).</p>\n</li>\n<li><strong>Technology, analytics, and marketing providers</strong> (site hosting, email, analytics, advertising).</li>\n<li><strong>Professional advisors, authorities, and successors</strong> (legal/tax advisors, lawful requests, or a\n  merger/asset sale).\nWe <strong>do not sell</strong> your personal information for money. Some sharing for analytics or advertising may\nqualify as a \"sale\" or \"share\" under certain US laws — you can opt out (see §2.9 and the Cookie\nPolicy).</li>\n</ul>\n<h3>2.6 Categories under CCPA/CPRA (last 12 months)</h3>\n<table>\n<thead>\n<tr>\n<th>Category</th>\n<th>Collected</th>\n<th>Disclosed for a business purpose</th>\n</tr>\n</thead>\n<tbody>\n<tr>\n<td>Identifiers (name, email, address, IP)</td>\n<td>Yes</td>\n<td>Yes (fulfillment, payment, analytics)</td>\n</tr>\n<tr>\n<td>Commercial information (orders)</td>\n<td>Yes</td>\n<td>Yes (fulfillment, payment)</td>\n</tr>\n<tr>\n<td>Internet/network activity</td>\n<td>Yes</td>\n<td>Yes (analytics, advertising)</td>\n</tr>\n<tr>\n<td>Approximate geolocation (from IP)</td>\n<td>Yes</td>\n<td>Yes (analytics, fraud prevention)</td>\n</tr>\n<tr>\n<td>Financial info (payment token, last 4)</td>\n<td>Yes</td>\n<td>Yes (payment processor)</td>\n</tr>\n<tr>\n<td>We do not \"sell\" personal information for money and do not knowingly process sensitive personal</td>\n<td></td>\n<td></td>\n</tr>\n<tr>\n<td>information to infer characteristics.</td>\n<td></td>\n<td></td>\n</tr>\n</tbody>\n</table>\n<h3>2.7 International transfers</h3>\n<p>Where we transfer personal data from the EEA/UK to countries without an adequacy decision, we rely on\nappropriate safeguards such as the EU <strong>Standard Contractual Clauses</strong> (and the UK Addendum where\nrelevant). Contact hello@mynottera.com for details.</p>\n<h3>2.8 Retention</h3>\n<p>We keep personal information only as long as necessary for the purposes above, including order\nrecords required for legal, tax, and accounting purposes, after which we delete or anonymize it.</p>\n<h3>2.9 Your rights</h3>\n<p><strong>EEA/UK (GDPR):</strong> access, rectification, erasure, restriction, portability, objection (including to\ndirect marketing), and withdrawal of consent at any time. You may also complain to your local data\nprotection authority.</p>\n<p><strong>California (CCPA/CPRA) and similar US state laws:</strong> the right to <strong>know/access</strong>, <strong>delete</strong>,\n<strong>correct</strong>, <strong>opt out of the sale/sharing</strong> of personal information and of targeted advertising,\n<strong>limit the use of sensitive personal information</strong>, and to <strong>non‑discrimination</strong> for exercising\nyour rights. You may use an authorized agent.</p>\n<ul>\n<li>\n<p><strong>To exercise a right:</strong> email hello@mynottera.com with enough information to verify your identity\n  (we cannot fulfill unverified requests, to protect your data).</p>\n</li>\n<li>\n<p><strong>\"Do Not Sell or Share My Personal Information\" / opt out of targeted ads:</strong> email\n  hello@mynottera.com or use our cookie‑preference controls. We also honor recognized opt‑out\n  signals (such as Global Privacy Control) where required.</p>\n</li>\n<li>\n<p>We respond within the timeframes required by law (generally 30–45 days).</p>\n</li>\n</ul>\n<h3>2.10 Marketing choices</h3>\n<p>Unsubscribe from marketing emails via the \"unsubscribe\" link or by contacting us. Transactional\nmessages (order and shipping updates) are not marketing and will still be sent.</p>\n<h3>2.11 Security</h3>\n<p>We use reasonable technical and organizational measures (encryption in transit, access controls, and\nreputable providers). No method is 100% secure, so we cannot guarantee absolute security.</p>\n<h3>2.12 Children</h3>\n<p>The site is not directed to children, and we do not knowingly collect data from anyone under 16 (or\nthe minimum age in your jurisdiction). If you believe a child provided data, contact\nhello@mynottera.com.</p>\n<h3>2.13 Cookies</h3>\n<p>See our <strong>Cookie Policy</strong>. We honor consent requirements for non‑essential cookies and provide\nopt‑out mechanisms.</p>\n<h3>2.14 Changes</h3>\n<p>We may update this Policy; material changes will be posted with a new date and, where required, we\nwill seek renewed consent.</p>\n<h3>2.15 Contact</h3>\n<p>support@mynottera.com.</p>"
+  },
+  "shipping": {
+    nav: "Shipping", "kicker": "Support",
+    "title": "Shipping",
+    "body": "<p><strong>Last updated: July 2026</strong></p>\n<h3>3.1 Where we ship</h3>\n<p>We currently ship within the <strong>United States</strong>.</p>\n<h3>3.2 Processing time</h3>\n<p>Orders are processed within <strong>1–4 business days</strong> after payment and verification. Orders placed on\nweekends or holidays are processed the next business day.</p>\n<h3>3.3 Delivery time</h3>\n<p>Estimated delivery is <strong>7–14 business days</strong> after processing. Delivery windows are <strong>estimates, not\nguarantees</strong>, and may be affected by carrier performance, customs, weather, or peak periods.</p>\n<h3>3.4 Shipping cost</h3>\n<p>Standard shipping is free on every pillow, no minimum. Pillowcases and other accessories ship free on US orders over $65 (a flat rate applies below that, shown at checkout). Any\nexpedited options and costs are shown at checkout.</p>\n<h3>3.5 Tracking</h3>\n<p>When your order ships, we email a tracking link. Please allow a few days for tracking to update.</p>\n<h3>3.6 Accurate address</h3>\n<p>You are responsible for entering a <strong>complete, accurate shipping address</strong>. We are not responsible\nfor orders delayed, lost, or returned due to an incorrect or incomplete address. If a package is\nreturned for this reason, you are responsible for any <strong>re‑shipping cost</strong>, or you may request a\nrefund <strong>minus</strong> original shipping and handling.</p>\n<h3>3.7 Customs, duties, and taxes</h3>\n<p>We currently ship <strong>within the United States only</strong>. Because our orders are domestic US shipments,\n<strong>no import duties or customs fees apply</strong>. If we begin offering international shipping in the\nfuture, this section will be updated before any international orders are accepted.</p>\n<h3>3.8 Delays</h3>\n<p>We are not liable for delays caused by carriers, customs, or force‑majeure events. If your order is\nsignificantly delayed, contact hello@mynottera.com and we will investigate.</p>\n<h3>3.9 Lost, stolen, or damaged in transit</h3>\n<ul>\n<li>\n<p><strong>Lost / not delivered:</strong> if tracking shows no delivery within the expected window, contact us\n  within <strong>30 days</strong> of the last tracking update. Once confirmed lost, we will arrange a\n  <strong>replacement or refund</strong>.</p>\n</li>\n<li>\n<p><strong>Marked delivered but not received:</strong> report within <strong>7 days</strong>; we will help open a carrier\n  investigation. Remedies depend on the carrier's findings.</p>\n</li>\n<li>\n<p><strong>Damaged on arrival:</strong> see the Return &amp; Refund Policy (report within 48 hours with photos).</p>\n</li>\n</ul>\n<h3>3.10 Multiple packages</h3>\n<p>Items may ship separately and arrive on different dates at no extra cost to you.</p>"
+  },
+  "track": {
+    nav: "Track Order", "kicker": "Support",
+    "title": "Track Your Order",
+    "body": "<p class=\"page-lead\">Enter your order number and the email you used at checkout to see your delivery status.</p><div id=\"trackRoot\"></div>"
+  },
+  "returns": {
+    nav: "Returns & Refunds", "kicker": "Support",
+    "title": "Return & Refund",
+    "body": "<p class=\"page-actions\"><a class=\"btn btn-primary\" href=\"mailto:support@mynottera.com?subject=Return%20request%20%E2%80%94%20Order%20%23&amp;body=Hi%20Nottera%20team%2C%0A%0AI%27d%20like%20to%20request%20a%20return%20or%20report%20an%20issue%20with%20my%20order.%0A%0AOrder%20number%3A%20%0AItem%28s%29%3A%20%0AReason%20%28change%20of%20mind%20/%20damaged%20/%20defective%20/%20wrong%20/%20missing%20/%20not%20delivered%29%3A%20%0A%0AIf%20the%20item%20is%20damaged%2C%20defective%2C%20wrong%2C%20or%20missing%2C%20please%20attach%20clear%20photos%20or%20a%20short%20video.%0A%0AThank%20you.\">Start a return</a></p><p class=\"page-muted\">This opens your email app with a ready-made template. You can also write to <a href=\"mailto:support@mynottera.com\">support@mynottera.com</a> with your order number and photos.</p><p><strong>Last updated: July 2026</strong></p>\n<p>We want you to love your Nottera products. Pillows come with our <strong>60‑Night Trial</strong>, described in §4.1 below. Pillowcases and other personal‑hygiene items follow a separate, standard change‑of‑mind policy in §4.2, since they cannot be resold once opened.</p>\n<h3>4.1 The 60‑Night Trial (pillows)</h3>\n<p>Every Nottera pillow comes with <strong>60 nights</strong> from the date of delivery to decide if it's right for you — used, slept on, flipped to either loft. If it isn't working out, contact us within the 60‑night window for a <strong>full refund</strong> to your original payment method. We provide a prepaid return label; you don't need to cover return shipping. Returned pillows are <strong>donated, not resold</strong>, so please return them reasonably clean.</p>\n<p>The 60‑Night Trial covers one return per pillow per customer, and does not apply to pillows that are damaged through misuse, or purchased through an unauthorized reseller. It runs alongside, and does not replace, your rights under §4.3 for defective, damaged, or wrong items.</p>\n<h3>4.2 Change‑of‑mind returns (pillowcases and other hygiene items)</h3>\n<p>For pillowcases, sleep masks, and similar personal‑hygiene items, you may request a return within <strong>30 days of delivery</strong> <strong>only if</strong> the item is <strong>unused, unwashed,\nand unopened</strong>, in its <strong>original sealed packaging</strong>, with all tags and inserts.</p>\n<p>For health and safety reasons, <strong>opened or used pillowcases, sleep masks, and similar hygiene items\ncannot be returned or refunded for change of mind.</strong> This does not affect your rights if an item is\ndefective, damaged, wrong, or lost (see §4.3).</p>\n<h3>4.2b Non‑returnable items</h3>\n<ul>\n<li>Opened or used pillowcases, sleep masks, or other hygiene items (outside §4.1’s pillow trial).</li>\n<li>Digital products (such as the Digital Sleep Guide).</li>\n<li>Gift cards and items marked \"final sale.\"</li>\n</ul>\n<h3>4.3 Defective, damaged, wrong, missing, or lost items</h3>\n<p>You are fully covered in these cases. Contact us within the windows below with your order number and\n<strong>clear photos or a short video</strong> of the issue (and the packaging for transit damage):</p>\n<ul>\n<li><strong>Damaged in transit or defective on arrival:</strong> report within <strong>48 hours</strong> of delivery.</li>\n<li><strong>Wrong item, wrong size/variant, or missing item:</strong> report within <strong>7 days</strong> of delivery.</li>\n<li><strong>Not delivered / lost in transit:</strong> report within <strong>30 days</strong> of the last tracking update.</li>\n</ul>\n<p>If your claim qualifies, we will, at our option, <strong>send a free replacement or issue a refund</strong>. You\nusually will <strong>not</strong> need to ship the item back; if a return is required, we provide a prepaid label.</p>\n<blockquote>\n<p><em>\"Defective\" means a genuine manufacturing fault or damage that affects use — not the normal\ncharacteristics of memory foam, such as a slight new‑product scent that fades, natural softening\nover time, or minor variation in color or texture.</em></p>\n</blockquote>\n<h3>4.4 How to start a return or claim</h3>\n<p>Email support@mynottera.com with: (1) your order number, (2) the item(s), (3) the reason, and (4) photos\nor video if reporting an issue. <strong>Do not</strong> ship anything back before receiving instructions —\nunauthorized returns may not be refunded.</p>\n<h3>4.5 Return shipping costs</h3>\n<ul>\n<li>\n<p><strong>Our error / defective / damaged / wrong item:</strong> we cover return shipping (if any) and the full\n  remedy.</p>\n</li>\n<li>\n<p><strong>60‑Night Trial return (pillows, per §4.1):</strong> we provide a prepaid return label. The refund covers the item's purchase price; original outbound shipping (if any was charged) is not refunded.</p>\n</li>\n<li>\n<p><strong>Change‑of‑mind return (unopened, per §4.2):</strong> you cover return shipping, and the refund excludes\n  original shipping and handling. A restocking fee of up to 15% may apply.</p>\n</li>\n</ul>\n<h3>4.6 Refunds</h3>\n<p>Approved refunds are issued to your <strong>original payment method</strong> within <strong>5–10 business days</strong> after we\napprove the claim or receive the returned item. Your bank may take additional time to post it. We\ncannot refund to a different account or method.</p>\n<h3>4.7 Cancellations and changes</h3>\n<p>You may request to cancel or change an order within <strong>2 hours</strong> of placing it, before it enters\nfulfillment. After fulfillment begins, we cannot guarantee changes, and standard return rules apply.</p>\n<h3>4.8 Customs refusals and failed deliveries</h3>\n<p>Consistent with the Shipping Policy, orders that are undeliverable, returned, destroyed, or delayed\nbecause the recipient <strong>refused to pay duties/taxes, failed customs clearance, or provided an\nincorrect address</strong> are <strong>not eligible for a refund</strong>.</p>\n<h3>4.9 Fair‑use</h3>\n<p>We may refuse, limit, or investigate returns and refunds that appear fraudulent, excessive, or in bad\nfaith, and may require additional verification. Approved remedies are provided in good faith and are\nnot an admission of liability.</p>\n<h3>4.10 Billing disputes</h3>\n<p>Please contact us before disputing a charge — we resolve most issues within 24 hours. Bad‑faith\ndisputes (for example, after delivery, or in place of a return) will be contested with evidence.</p>\n<h3>4.11 Your statutory rights</h3>\n<p>Nothing in this policy limits any non‑waivable rights you may have under applicable consumer law.</p>"
+  },
+  "warranty": {
+    nav: "Warranty", "kicker": "Warranty",
+    "title": "Warranty",
+    "body": "<p><strong>Last updated: July 2026</strong></p>\n<h3>5.1 Limited warranty</h3>\n<p>Nottera warrants that its physical products are free from <strong>manufacturing defects in materials and\nworkmanship under normal use</strong> for <strong>three (3) years from the date of delivery</strong> (the \"Warranty\nPeriod\"). This warranty covers <strong>genuine factory/manufacturing defects only — not damage caused by\nmisuse, accidents, improper care, or normal wear.</strong> It is provided to the <strong>original purchaser</strong> and\nis <strong>non‑transferable</strong>.</p>\n<h3>5.2 What is covered</h3>\n<p>Genuine manufacturing faults under normal, intended use — for example, seams that fail, foam that\nprematurely and permanently loses its supportive structure beyond normal wear, or a cover or zipper\nthat fails under normal use.</p>\n<h3>5.3 What is not covered</h3>\n<ul>\n<li>Normal wear and tear; gradual, expected softening or minor loss of loft over time.</li>\n<li>Damage from misuse, accidents, improper cleaning, or failure to follow care instructions.</li>\n<li>Stains, odors, or discoloration caused by use.</li>\n<li>Cosmetic variations (color or texture) inherent to the materials.</li>\n<li>Items without proof of purchase, or purchased from an unauthorized reseller.</li>\n<li>Comfort preference (a warranty covers defects, not personal comfort — pillows have their own 60‑Night Trial, and pillowcases have a change‑of‑mind window on unopened items; see the Return &amp; Refund Policy).</li>\n</ul>\n<h3>5.4 Remedy</h3>\n<p>If a valid claim is approved, we will, <strong>at our discretion, repair, replace, or refund</strong> the affected\nproduct. Replacement may be with the same or a comparable product if the original is unavailable.\nThis is your <strong>sole and exclusive remedy</strong> under this Limited Warranty.</p>\n<h3>5.5 How to claim</h3>\n<p>Email support@mynottera.com with your <strong>order number, proof of purchase, and photos or video</strong> of the\ndefect. We may request additional information or, in some cases, return of the item.</p>\n<h3>5.6 Limits</h3>\n<p>To the maximum extent permitted by law, this Limited Warranty is in lieu of all other warranties, and\nour liability is limited as set out in the Terms of Service (§1.12–1.13). This warranty gives you\nspecific legal rights; you may also have other rights under your local law, which are not affected.</p>"
+  },
+  "cookies": {
+    nav: "Cookie Policy", "kicker": "Legal",
+    "title": "Cookie Policy",
+    "body": "<p><strong>Last updated: July 2026</strong></p>\n<h3>6.1 What cookies are</h3>\n<p>Cookies and similar technologies (pixels, local storage) are small files stored on your device that\nhelp the site work, remember preferences, measure performance, and support marketing.</p>\n<h3>6.2 Categories we use</h3>\n<table>\n<thead>\n<tr>\n<th>Category</th>\n<th>Purpose</th>\n<th>Consent</th>\n</tr>\n</thead>\n<tbody>\n<tr>\n<td><strong>Strictly necessary</strong></td>\n<td>Core functions: cart, checkout, security</td>\n<td>Always active</td>\n</tr>\n<tr>\n<td><strong>Functional</strong></td>\n<td>Remember preferences (e.g., region, recently viewed)</td>\n<td>Consent where required</td>\n</tr>\n<tr>\n<td><strong>Analytics/Performance</strong></td>\n<td>Understand site usage to improve it</td>\n<td>Consent where required</td>\n</tr>\n<tr>\n<td><strong>Marketing/Targeting</strong></td>\n<td>Measure and personalize ads</td>\n<td>Consent / opt‑out where required</td>\n</tr>\n</tbody>\n</table>\n<h3>6.3 Your choices</h3>\n<p>Strictly necessary cookies are used to operate the site. For non‑essential cookies (functional,\nanalytics, marketing), we rely on your <strong>consent</strong> where required and provide an <strong>opt‑out</strong> where\nrequired. You can:</p>\n<ul>\n<li>Use our <strong>cookie preferences</strong> tool to accept or reject non‑essential categories.</li>\n<li>Change your browser settings to block or delete cookies (this may affect functionality).</li>\n<li>Use recognized opt‑out signals (such as <strong>Global Privacy Control</strong>) where honored.</li>\n</ul>\n<h3>6.4 Third‑party cookies</h3>\n<p>Some cookies are set by providers such as analytics, advertising, and payment partners, whose use of\ndata is governed by their own privacy policies.</p>\n<h3>6.5 Changes</h3>\n<p>We may update this Cookie Policy; the \"Last updated\" date reflects the latest version.</p>\n<h3>6.6 Contact</h3>\n<p>hello@mynottera.com.</p>"
+  },
+  "payment": {
+    nav: "Payment Policy", "kicker": "Payment",
+    "title": "Payment Policy",
+    "body": "<p><strong>Last updated: July 2026</strong></p>\n<h3>7.1 Accepted methods</h3>\n<p>We accept major credit and debit cards (Visa, Mastercard, American Express, Discover) and <code>[PayPal, Shop Pay, Apple Pay, Google\nPay]</code> as shown at checkout. Availability may vary by device and region.</p>\n<h3>7.2 Currency and taxes</h3>\n<p>All prices are in <strong>USD</strong> and exclusive of taxes unless stated. Applicable <strong>sales tax</strong> is added at\ncheckout where required. You are responsible for any import duties or taxes on international orders\n(see Shipping Policy §3.7).</p>\n<h3>7.3 Authorization and charging</h3>\n<p>By placing an order, you authorize us and our payment processor to <strong>verify and charge</strong> your payment\nmethod for the total shown, including taxes and shipping. We may place an <strong>authorization hold</strong> and\ncapture payment at or before fulfillment. If payment is declined or cannot be verified, we may cancel\nthe order.</p>\n<h3>7.4 Fraud prevention and verification</h3>\n<p>To protect you and us, orders are screened for fraud. We may request additional verification and may\n<strong>cancel or refuse</strong> orders that fail verification or appear high‑risk.</p>\n<h3>7.5 Security</h3>\n<p>Payments are processed by <strong>PCI‑DSS‑compliant</strong> third‑party processors. <strong>We do not store your full\ncard number</strong>; sensitive payment data is handled by the processor.</p>\n<h3>7.6 Pricing errors</h3>\n<p>We may cancel orders affected by obvious pricing or typographical errors, even after confirmation,\nand will refund any amount charged (see Terms §1.5).</p>\n<h3>7.7 Promotions and discounts</h3>\n<p>Unless stated, only <strong>one discount code per order</strong>; codes have no cash value, cannot be combined,\nand may be modified or revoked. We may void orders where discounts or referrals are abused or\nobtained fraudulently.</p>\n<h3>7.8 Billing disputes</h3>\n<p>Contact hello@mynottera.com before disputing a charge; we resolve most issues within 24 hours.</p>"
+  },
+  "contact": {
+    nav: "Contact", "kicker": "Contact",
+    "title": "Contact & Support",
+    "body": "<p><strong>Last updated: July 2026</strong></p>\n<h3>8.1 How to reach us</h3>\n<ul>\n<li><strong>Returns, warranty &amp; help:</strong> support@mynottera.com — for a return or replacement, a warranty claim, or any problem with your order, write to us here.</li>\n<li><strong>General &amp; orders:</strong> hello@mynottera.com</li>\n<li><strong>Privacy requests:</strong> hello@mynottera.com</li>\n<li><strong>Mailing address (legal notices):</strong> Nottera, mailing address available on request</li>\n</ul>\n<h3>8.2 Support hours and response times</h3>\n<p>We provide support <strong>7 days a week</strong> and aim to reply to every message <strong>within 24 hours</strong>. During\npeak periods or holidays, responses may take slightly longer.</p>\n<h3>8.3 What to include</h3>\n<p>To help us resolve your request quickly, please include your <strong>order number</strong>, the email used to\norder, and — for any product issue — a <strong>clear description and photos or a short video</strong>.</p>\n<h3>8.4 Scope of support</h3>\n<p>Our team can help with orders, shipping and tracking, returns/refunds and warranty claims (per the\nrelevant policies), product questions, and privacy requests. For returns, warranty claims or any help with an order, email <strong>support@mynottera.com</strong>. For medical questions, please consult a\nhealthcare professional — our products are not medical devices (Terms §1.7).</p>\n<h3>8.5 Escalation</h3>\n<p>If you are not satisfied with a resolution, reply to your existing email thread and ask for it to be\n<strong>escalated</strong>; a senior team member will review and respond.</p>\n<h3>8.6 Language</h3>\n<p>Support is provided in <strong>English</strong>. We will never ask for your full\ncard number or password by email — please never share them.</p>\n<p><em>These policies are provided for transparency and may be updated from time to time. The version shown\non mynottera.com with the most recent \"Last updated\" date applies.</em></p>"
+  }
+};
+function initPages() {
+  /* Real content pages, not modals. The view is inserted into the document
+     flow after <main>, so the site header stays fixed at the top, the footer
+     stays at the bottom, and the browser scrolls the page normally. Routed at
+     #/<slug> so a page can be linked, reloaded and shared, and so the browser
+     Back button returns to the landing page on its own. */
+  const view = document.createElement('article');
+  view.className = 'page-view';
+  view.hidden = true;
+  view.innerHTML = `
+    <div class="page-panel">
+      <nav class="page-crumb" aria-label="Breadcrumb">
+        <a href="#top">Nottera</a>
+        <span aria-hidden="true">/</span>
+        <span class="page-crumb-current" aria-current="page"></span>
+      </nav>
+      <p class="kicker page-kicker"></p>
+      <h1 class="page-title"></h1>
+      <div class="page-body"></div>
+      <a class="page-back" href="#top">&larr; Back to Nottera</a>
+    </div>`;
+
+  const main = document.querySelector('main');
+  const footer = document.querySelector('.footer');
+  main.parentNode.insertBefore(view, main.nextSibling);
+
+  const crumbEl = view.querySelector('.page-crumb-current');
+  const kickerEl = view.querySelector('.page-kicker');
+  const titleEl = view.querySelector('.page-title');
+  const bodyEl = view.querySelector('.page-body');
+  const baseTitle = document.title;
+  let current = null;
+
+  function slugFromHash() {
+    const m = location.hash.match(/^#\/([a-z]+)$/);
+    return m && PAGES[m[1]] ? m[1] : null;
+  }
+
+  function open(slug) {
+    const page = PAGES[slug];
+    crumbEl.textContent = page.nav || page.title;
+    kickerEl.textContent = page.kicker;
+    titleEl.textContent = page.title;
+    bodyEl.innerHTML = page.body;
+    // Swap the landing page out for this one — a page change, not an overlay.
+    main.hidden = true;
+    view.hidden = false;
+    if (footer) footer.hidden = false;
+    document.title = (page.title || page.nav) + ' — Nottera';
+    current = slug;
+    // Land at the top of the new page. Repeated across the next frames because
+    // the landing page's scroll-driven sections settle their own offsets as
+    // they unmount, which can otherwise nudge the document back down.
+    const toTop = () => scrollTo({ top: 0, behavior: 'instant' });
+    toTop();
+    requestAnimationFrame(() => { view.classList.add('open'); toTop(); });
+    setTimeout(toTop, 60);
+  }
+
+  function close() {
+    view.classList.remove('open');
+    view.hidden = true;
+    main.hidden = false;
+    document.title = baseTitle;
+    current = null;
+  }
+
+  function sync() {
+    const slug = slugFromHash();
+    if (slug) { if (slug !== current) open(slug); else scrollTo({ top: 0, behavior: 'instant' }); }
+    else if (current) close();
+  }
+
+  view.querySelector('.page-back').addEventListener('click', () => {
+    // Let the hash change drive the route; sync() restores the landing page.
+    setTimeout(sync, 0);
+  });
+  addEventListener('hashchange', sync);
+
+  sync();
+  // Safety net: some PAGES entries (journal, pillowcase color pages, etc.) are
+  // registered by later inline scripts further down this document. If a user
+  // navigates to one of those routes before the page has fully finished
+  // loading/parsing, the check above can run before that entry exists and
+  // silently fall back to the landing page. Re-validate once everything has
+  // loaded so the route resolves correctly instead of getting stuck on the hero.
+  addEventListener('load', sync);
+}
+
+// fractional star display: fills to the exact proportion (4.9/5 → 98%, not a full row)
+const pdpStars = (r) => {
+  const pct = Math.max(0, Math.min(100, (r / 5) * 100));
+  return `<span class="stars-wrap"><span class="stars-base">★★★★★</span>`
+       + `<span class="stars-fill" style="width:${pct}%">★★★★★</span></span>`;
+};
+
+/* Announcement bar: a slim, dismissible top ribbon with rotating messages.
+   Portable to Shopify — swap MESSAGES for section settings / a metafield. */
+
+const DISMISS_KEY = 'notterra-announce';
+const MESSAGES = [
+  'Free shipping on every pillow',
+  'Delivered in 7–14 days · tracked',
+  '3-year warranty · 60-night trial',
+  'First order? Get 10% off'
+];
+/* slot 0 of the rotation is dynamic: it nudges toward the $65 free-shipping
+   threshold once there's a cart to nudge, and falls back to the static
+   line otherwise — same $65 the cart drawer and value band already quote. */
+function shippingMessage() {
+  if (window.NotteraCart && typeof window.NotteraCart.getTotal === 'function') {
+    const countEl = document.getElementById('cartCount');
+    const hasItems = countEl && !countEl.hidden;
+    const total = window.NotteraCart.getTotal();
+    if (hasItems && total > 0 && total < 65) {
+      return `Add $${(65 - total).toFixed(2)} more for free shipping`;
+    }
+  }
+  return MESSAGES[0];
+}
+function initAnnounce() {
+  if (localStorage.getItem(DISMISS_KEY) === '1') return;
+
+  const bar = document.createElement('div');
+  bar.className = 'announce';
+  bar.innerHTML = `
+    <div class="announce-track" id="announceTrack"><span>${shippingMessage()}</span></div>
+    <button class="announce-close" id="announceClose" aria-label="Dismiss announcement">&times;</button>`;
+  document.body.insertBefore(bar, document.body.firstChild);
+  document.body.classList.add('has-announce');
+
+  const track = bar.querySelector('#announceTrack span');
+  let idx = 0;
+  function show(i) {
+    track.style.opacity = '0';
+    setTimeout(() => { track.textContent = i === 0 ? shippingMessage() : MESSAGES[i]; track.style.opacity = '1'; }, 350);
+  }
+  const timer = setInterval(() => {
+    idx = (idx + 1) % MESSAGES.length;
+    show(idx);
+  }, 4200);
+
+  // if the shipping slot is on screen right now, refresh it the moment the cart changes
+  const cartItemsEl = document.getElementById('cartItems');
+  if (cartItemsEl) {
+    new MutationObserver(() => { if (idx === 0) show(0); }).observe(cartItemsEl, { childList: true, subtree: true, characterData: true });
+  }
+
+  bar.querySelector('#announceClose').addEventListener('click', () => {
+    clearInterval(timer);
+    bar.classList.add('closing');
+    document.body.classList.remove('has-announce');
+    localStorage.setItem(DISMISS_KEY, '1');
+    setTimeout(() => bar.remove(), 400);
+  });
+}
+
+/* Cookie consent banner (GDPR / CCPA-friendly). Stores the choice and exposes
+   it on window.NotteraConsent so analytics/marketing scripts can gate on it.
+   Wire real tag-loading into applyConsent() when you connect GA / Meta / etc. */
+
+const KEY = 'notterra-consent';
+function initConsent() {
+  const saved = localStorage.getItem(KEY);
+  window.NotteraConsent = saved || 'unset';
+  if (saved) {
+    // Re-sync with Shopify on every visit, not just the one where the choice
+    // was made — a returning visitor's saved choice still needs to reach
+    // Shopify's consent API each time the page loads.
+    applyConsent(saved);
+    return;
+  }
+
+  const bar = document.createElement('div');
+  bar.className = 'consent';
+  bar.setAttribute('role', 'dialog');
+  bar.setAttribute('aria-label', 'Cookie notice');
+  bar.innerHTML = `
+    <p class="consent-text">
+      We use cookies to run the store, remember your cart and understand what helps people sleep better.
+      See our <a href="#/cookies">Cookie Policy</a>.
+    </p>
+    <div class="consent-actions">
+      <button class="consent-btn ghost" data-consent="declined" type="button">Decline</button>
+      <button class="consent-btn solid" data-consent="accepted" type="button">Accept</button>
+    </div>`;
+  document.body.appendChild(bar);
+  requestAnimationFrame(() => bar.classList.add('open'));
+
+  bar.addEventListener('click', (e) => {
+    const btn = e.target.closest('[data-consent]');
+    if (!btn) return;
+    const choice = btn.dataset.consent;
+    localStorage.setItem(KEY, choice);
+    window.NotteraConsent = choice;
+    applyConsent(choice);
+    bar.classList.remove('open');
+    setTimeout(() => bar.remove(), 400);
+  });
+}
+
+function applyConsent(choice) {
+  const accepted = choice === 'accepted';
+  // Registers the choice with Shopify's real Customer Privacy API — this is
+  // what actually gates Shopify's own tracking and stops Shopify's native
+  // cookie banner from appearing on top of ours (it only shows when no
+  // consent decision has been recorded yet).
+  if (window.Shopify && window.Shopify.customerPrivacy && typeof window.Shopify.customerPrivacy.setTrackingConsent === 'function') {
+    window.Shopify.customerPrivacy.setTrackingConsent({
+      analytics: accepted,
+      marketing: accepted,
+      preferences: accepted,
+      sale_of_data: accepted
+    }, function () {});
+  }
+}
+
+
+/* Header account dropdown. Portable to Shopify: the Sign In / Create Account
+   items already point to hash routes that render maquette pages; when the
+   theme is published, swap their href for /account/login and /account/register
+   so Shopify's built-in customer accounts take over. */
+function initUserMenu() {
+  const wrap = document.getElementById('userMenu');
+  const btn = document.getElementById('userToggle');
+  const dropdown = document.getElementById('userDropdown');
+  if (!wrap || !btn || !dropdown) return;
+
+  function close() {
+    dropdown.hidden = true;
+    btn.setAttribute('aria-expanded', 'false');
+    wrap.classList.remove('open');
+  }
+  function open() {
+    dropdown.hidden = false;
+    btn.setAttribute('aria-expanded', 'true');
+    wrap.classList.add('open');
+  }
+  function toggle() {
+    dropdown.hidden ? open() : close();
+  }
+
+  btn.addEventListener('click', (e) => { e.stopPropagation(); toggle(); });
+  document.addEventListener('click', (e) => { if (!wrap.contains(e.target)) close(); });
+  addEventListener('keydown', (e) => { if (e.key === 'Escape') close(); });
+  // any dropdown link click closes it before the hashchange nav
+  dropdown.querySelectorAll('a').forEach((a) => a.addEventListener('click', close));
+}
+
+/* Nottera account + rewards balance — demo persistence via localStorage.
+   One browser = one account here; wire this to Shopify customer accounts +
+   a loyalty app (e.g. Smile.io) for real cross-device accounts at launch. */
+
+const ACCOUNT_KEY = 'notterra-account';
+
+function load() {
+  try {
+    const raw = localStorage.getItem(ACCOUNT_KEY);
+    return raw ? JSON.parse(raw) : null;
+  } catch { return null; }
+}
+function save(acc) {
+  try { localStorage.setItem(ACCOUNT_KEY, JSON.stringify(acc)); } catch {}
+}
+
+function initAccount() {
+  const toast = document.getElementById('toast');
+  let toastTimer = null;
+  function showToast(message) {
+    if (!toast) return;
+    toast.textContent = message;
+    toast.classList.add('show');
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => toast.classList.remove('show'), 3200);
+  }
+
+  function render() {
+    const mount = document.getElementById('accountApp');
+    if (!mount) return;
+    const acc = load();
+
+    if (!acc) {
+      mount.innerHTML = `
+        <form class="account-form" id="accountCreateForm">
+          <input class="popup-input" type="email" name="email" placeholder="Your email" required>
+          <input class="popup-input" type="password" name="password" placeholder="Create a password" required minlength="6">
+          <button class="btn btn-primary popup-submit" type="submit">Create Account · +100 pts</button>
+        </form>
+        <p class="page-muted">Already have an account? <a href="#" id="accountSignInLink">Sign in</a>.</p>`;
+      mount.querySelector('#accountCreateForm').addEventListener('submit', (e) => {
+        e.preventDefault();
+        const email = e.target.email.value.trim();
+        if (!email) return;
+        const created = { email, points: 100, createdAt: Date.now() };
+        save(created);
+        showToast('Account created — +100 points');
+        render();
+      });
+      mount.querySelector('#accountSignInLink').addEventListener('click', (e) => {
+        e.preventDefault();
+        showToast('No Nottera account found on this device yet — create one above');
+      });
+      return;
+    }
+
+    mount.innerHTML = `
+      <div class="account-dash">
+        <div class="account-dash-row">
+          <div><span class="account-dash-label">Signed in as</span><span class="account-dash-value">${acc.email}</span></div>
+          <div><span class="account-dash-label">Points balance</span><span class="account-dash-value gold">${acc.points}</span></div>
+        </div>
+        <p class="page-actions"><a class="btn btn-ghost" href="#/rewards">Redeem points</a><button class="btn btn-ghost" type="button" id="accountSignOut">Sign out</button></p>
+      </div>`;
+
+    mount.querySelector('#accountSignOut')?.addEventListener('click', () => {
+      localStorage.removeItem(ACCOUNT_KEY);
+      render();
+    });
+  }
+
+  function renderRewardsBalance() {
+    const mount = document.getElementById('rewardsBalance');
+    if (!mount) return;
+    const acc = load();
+    if (!acc) { mount.innerHTML = ''; return; }
+    mount.innerHTML = `
+      <div class="account-dash rewards-balance">
+        <div class="account-dash-row">
+          <div><span class="account-dash-label">Signed in as</span><span class="account-dash-value">${acc.email}</span></div>
+          <div><span class="account-dash-label">Points balance</span><span class="account-dash-value gold">${acc.points}</span></div>
+        </div>
+      </div>`;
+  }
+
+  /* My Orders — every order recorded against the signed-in account, newest
+     first. In this demo, orders are recorded locally at checkout (see
+     recordOrder below); on Shopify this would read the customer's real
+     order history via the Customer Account API instead. */
+  function renderOrders() {
+    const mount = document.getElementById('ordersApp');
+    if (!mount) return;
+    const acc = load();
+    if (!acc) {
+      mount.innerHTML = `<div class="orders-empty">
+        <p>Sign in to see your orders.</p>
+        <a class="btn btn-primary" href="{{ routes.account_url }}">Sign in / Create account</a>
+      </div>`;
+      return;
+    }
+    const orders = acc.orders || [];
+    if (!orders.length) {
+      mount.innerHTML = `<div class="orders-empty"><p>No orders yet — your first one will show up here.</p></div>`;
+      return;
+    }
+    mount.innerHTML = `<div class="orders-list">` + orders.map((o) => `
+      <div class="order-card">
+        <div class="order-card-head">
+          <div><span class="order-card-id">Order #${o.id}</span><span class="order-card-date">${new Date(o.date).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })}</span></div>
+          <span class="order-card-total">${'$' + o.total.toFixed(2)}</span>
+        </div>
+        <ul class="order-card-items">
+          ${o.items.map((it) => `<li>${it.qty} &times; ${it.variant && it.variant !== it.name ? it.variant : it.name}</li>`).join('')}
+        </ul>
+        <a class="order-card-track" href="{{ routes.account_url }}">Track this order &rarr;</a>
+      </div>`).join('') + `</div>`;
+  }
+
+  var REAL_ACCOUNT_URL = '{{ routes.account_url }}';
+  function goToRealAccount() { window.location.href = REAL_ACCOUNT_URL; }
+
+  addEventListener('hashchange', () => {
+    if (location.hash === '#/account') { goToRealAccount(); return; }
+    if (location.hash === '#/rewards') renderRewardsBalance();
+    if (location.hash === '#/orders') { goToRealAccount(); return; }
+  });
+  if (location.hash === '#/account') { goToRealAccount(); }
+  if (location.hash === '#/rewards') renderRewardsBalance();
+  if (location.hash === '#/orders') { goToRealAccount(); }
+
+  /* Exposed so the cart can credit purchase points and record the order at checkout. */
+  window.NotteraAccount = {
+    creditPurchasePoints(amount) {
+      const acc = load();
+      if (!acc) return;
+      acc.points += Math.round(amount * 2);
+      save(acc);
+    },
+    recordOrder(itemsSnapshot, total) {
+      const acc = load();
+      if (!acc) return null;
+      acc.orders = acc.orders || [];
+      const id = 'NT' + Math.floor(10000 + Math.random() * 90000);
+      acc.orders.unshift({ id, date: Date.now(), items: itemsSnapshot, total });
+      save(acc);
+      return id;
+    },
+    isSignedIn() { return !!load(); }
+  };
+}
+
+/* "By the numbers" count-up. Each .stat-count animates from 0 to data-to when
+   it scrolls into view (easeOutCubic). Honors prefers-reduced-motion. */
+function initStats() {
+  const nums = document.querySelectorAll('.stat-count');
+  if (!nums.length) return;
+  const reduce = matchMedia('(prefers-reduced-motion: reduce)').matches;
+  const fmt = (n, sep) => sep ? Math.round(n).toLocaleString('en-US') : String(Math.round(n));
+  const run = (el) => {
+    const to = parseFloat(el.dataset.to) || 0;
+    const sep = el.dataset.sep === '1';
+    if (reduce) { el.textContent = fmt(to, sep); return; }
+    const dur = 1600, t0 = performance.now();
+    const tick = (now) => {
+      const p = Math.min(1, (now - t0) / dur);
+      const e = 1 - Math.pow(1 - p, 3);
+      el.textContent = fmt(to * e, sep);
+      if (p < 1) requestAnimationFrame(tick);
+    };
+    requestAnimationFrame(tick);
+  };
+  const io = new IntersectionObserver((entries) => {
+    entries.forEach((en) => { if (en.isIntersecting) { run(en.target); io.unobserve(en.target); } });
+  }, { threshold: 0.6 });
+  nums.forEach((el) => io.observe(el));
+}
+
+try{var __nc=JSON.parse(localStorage.getItem('notterra-cart')||'[]');if(Array.isArray(__nc)){localStorage.setItem('notterra-cart',JSON.stringify(__nc.filter(function(i){if(!i)return false;if(i.id==='pillow')return false;if(i.id==='kit')return false;return true;})));}}catch(e){}
+[initAtmosphere,initReveal,initParallax,initFaq,initCart,initScenes,initPages,initAnnounce,initConsent,initUserMenu,initAccount,initStats].forEach(function(fn){try{fn();}catch(e){console.error('Nottera init failed:',fn.name,e);}});
+
+</script>
+
+
+
+
+<!-- ============ BEDDING · SHOP BY FABRIC (added) ============ -->
+<style>
+.bed-lead{max-width:38em;color:var(--fg-soft);font-size:clamp(1rem, 1.4vw, 1.15rem);line-height:1.85;margin:-.6rem 0 2.8rem;font-weight:300}
+.bed-tabs,.bed-layout,.bed-fabwrap{width:min(1120px,90vw);margin-left:50%;transform:translateX(-50%)}
+/* Shop by fabric tiles */
+.bed-fabwrap{margin-bottom:3rem}
+.bed-secttl{font-family:var(--serif);font-weight:500;font-size:1.5rem;letter-spacing:.01em;color:var(--fg);margin:0 0 1.3rem}
+.bed-fabtiles{display:grid;grid-template-columns:1fr 1fr;gap:1.4rem}
+.bed-fabtile{position:relative;background:none;border:none;padding:0;cursor:pointer;text-align:left;display:flex;flex-direction:column;gap:.9rem;transition:transform .35s var(--ease)}
+.bed-fabtile:hover{transform:translateY(-4px)}
+.bed-fabtile-img{position:relative;aspect-ratio:16/10;border-radius:16px;overflow:hidden;border:1px solid var(--fg-faint);box-shadow:0 22px 50px rgba(0,0,0,.35)}
+.bed-fabtile-img::after{content:'';position:absolute;inset:0;background:radial-gradient(140% 120% at 25% 15%,rgba(255,255,255,.35),transparent 55%)}
+.bed-fabtile-img.sat{background:linear-gradient(125deg,#c6d0df 0%,#95a0b2 48%,#e9eef6 100%)}
+.bed-fabtile-img.slk{background:linear-gradient(125deg,#efe4cf 0%,#cdb187 48%,#f7f0e1 100%)}
+.bed-fabtile.is-active .bed-fabtile-img{outline:2px solid var(--gold);outline-offset:3px}
+.bed-fabtile-cap{display:flex;flex-direction:column;gap:.2rem;padding-left:.15rem}
+.bed-fabtile-name{font-family:var(--serif);font-weight:500;font-size:1.5rem;color:var(--fg);line-height:1}
+.bed-fabtile-sub{font-size:.82rem;color:var(--fg-soft);letter-spacing:.01em;font-weight:300}
+.bed-viewall{display:inline-block;margin-top:1.3rem;background:none;border:none;color:var(--gold);font:inherit;font-size:.72rem;font-weight:600;letter-spacing:.18em;text-transform:uppercase;cursor:pointer;padding:0;opacity:0;pointer-events:none;transition:opacity .3s}
+.bed-viewall.show{opacity:1;pointer-events:auto}
+/* layout */
+.bed-layout{display:grid;grid-template-columns:210px 1fr;gap:3rem;align-items:start}
+.bed-filters{position:sticky;top:8rem;display:flex;flex-direction:column;gap:1.5rem}
+.bed-fhead{font-size:.7rem;font-weight:700;letter-spacing:.22em;text-transform:uppercase;color:var(--fg)}
+.bed-fgroup{display:flex;flex-direction:column;gap:.7rem;padding-bottom:1.4rem;border-bottom:1px solid var(--fg-faint)}
+.bed-flabel{font-size:.68rem;font-weight:700;letter-spacing:.16em;text-transform:uppercase;color:var(--fg-soft);margin-bottom:.1rem}
+.bed-check{display:flex;align-items:center;gap:.6rem;font-size:.92rem;color:var(--fg-soft);cursor:pointer;font-weight:300}
+.bed-check input{accent-color:var(--gold);width:15px;height:15px;cursor:pointer;margin:0}
+.bed-check:hover{color:var(--fg)}
+.bed-dot{width:15px;height:15px;border-radius:50%;display:inline-block;box-shadow:0 0 0 1px var(--fg-faint)}
+.bed-dot.is-light{box-shadow:0 0 0 1px rgba(0,0,0,.22)}
+.bed-clear{align-self:flex-start;background:none;border:none;color:var(--gold);font:inherit;font-size:.78rem;letter-spacing:.04em;cursor:pointer;padding:0}
+.bed-clear:hover{text-decoration:underline}
+.bed-count{font-size:.72rem;letter-spacing:.14em;color:var(--fg-soft);margin:0 0 1.4rem;text-transform:uppercase}
+.bed-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(215px,1fr));gap:1.8rem}
+.bed-card{display:flex;flex-direction:column;cursor:default}
+.bed-thumb{position:relative;aspect-ratio:1/1;border-radius:14px;overflow:hidden;transition:transform .35s var(--ease),box-shadow .35s var(--ease)}
+.bed-thumb-img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}
+.bed-thumb::after{content:'';position:absolute;inset:0;background:radial-gradient(130% 120% at 28% 18%,rgba(255,255,255,.22),transparent 60%)}
+.bed-card:hover .bed-thumb{transform:translateY(-4px);box-shadow:0 20px 44px rgba(0,0,0,.4)}
+.bed-thumb-tag{position:absolute;top:.7rem;left:.7rem;z-index:2;font-size:.58rem;font-weight:600;letter-spacing:.14em;text-transform:uppercase;color:rgba(0,0,0,.6);background:rgba(255,255,255,.6);padding:.28rem .6rem;border-radius:40px}
+/* Marks the two colours that match the brand palette (navy + champagne). Sits
+   beside the fabric tag, in champagne so it reads as a seal, not a second label. */
+.bed-thumb-sig{position:absolute;top:.7rem;left:5.4rem;z-index:2;font-size:.58rem;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:var(--navy);background:var(--gold);padding:.28rem .6rem;border-radius:40px;white-space:nowrap}
+.bed-thumb-limited{position:absolute;bottom:.7rem;left:.7rem;z-index:2;font-size:.58rem;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:#fff;background:#c0392b;padding:.28rem .6rem;border-radius:40px;white-space:nowrap}
+@media (max-width:520px){.bed-thumb-sig{top:auto;bottom:.7rem;left:.7rem}}
+.bed-from{font-size:.7rem;letter-spacing:.1em;text-transform:uppercase;color:var(--fg-soft);margin-right:.35rem}
+.bed-clink{display:block;text-decoration:none;color:inherit}
+.bed-clink:hover .bed-cname{color:var(--gold)}
+.bed-cbody{padding:1rem .2rem 0;display:flex;flex-direction:column;gap:.3rem}
+.bed-cname{font-family:var(--serif);font-weight:500;font-size:1.4rem;margin:0;color:var(--fg);line-height:1.15}
+.bed-cmeta{font-size:.8rem;color:var(--fg-soft);margin:0;font-weight:300;letter-spacing:.01em}
+.bed-price{display:flex;align-items:baseline;gap:.55rem;flex-wrap:wrap;margin:.5rem 0 .9rem}
+.bed-now{font-weight:600;font-size:1.02rem;color:var(--fg)}
+.bed-was{font-size:.85rem;color:var(--fg-soft);text-decoration:line-through}
+.bed-save{font-size:.62rem;font-weight:600;letter-spacing:.06em;color:#c0392b;border:1px solid var(--fg-faint);border-radius:40px;padding:.14rem .5rem}
+.bed-add,.bed-choosesize{width:100%;text-align:center;padding:.8rem 1rem;font-size:.7rem;border:none;cursor:pointer;letter-spacing:.16em}
+@media (max-width:860px){
+  .bed-layout{grid-template-columns:1fr;gap:1.6rem}
+  .bed-filters{position:static;flex-direction:row;flex-wrap:wrap;gap:1.2rem}
+  .bed-fgroup{border-bottom:none;padding-bottom:0}
+  .bed-fabtiles{gap:1rem}
+  .bed-fabtile-name{font-size:1.25rem}
+}
+</style>
+<script>
+(function(){
+  var COLORS=[
+    {k:'moonlight',name:'Moonlight',sw:'#E0D2C3',light:true},
+    {k:'nebula',name:'Nebula',sw:'#62615F'},
+    {k:'polaris',name:'Polaris',sw:'#2A3858'},
+    {k:'aurora',name:'Aurora',sw:'#496C73'},
+    {k:'venus',name:'Venus',sw:'#F3AEC4',light:true}
+  ];
+  var FABRICS=[
+    {k:'ice',name:'Ice-Silk',cls:'ice',sub:'Cool, smooth, low-friction',sizes:{crescent:[28.99,36.99],eclipse:[32.99,41.99]},ids:{crescent:'casecrescent',eclipse:'caseeclipse'}}
+  ];
+  var SIZES=[{k:'crescent',name:'Crescent'},{k:'eclipse',name:'Eclipse'}];
+
+  /* One card per colour, not per colour+size: both sizes look identical in a
+     thumbnail, so listing them twice just doubled the grid. The size is chosen
+     on the product page, which already has its own Crescent/Eclipse selector —
+     so the card links there instead of adding a fixed size straight to cart. */
+  var SIGNATURE=['polaris','moonlight']; // the two brand colours: navy + champagne
+  function cards(){
+    var h='';
+    FABRICS.forEach(function(f){
+      COLORS.forEach(function(c){
+        // price runs "from" the smaller size, since one card now covers both
+        var lo=f.sizes.crescent, now=lo[0], was=lo[1], save=Math.round((1-now/was)*100);
+        var onSale=(c.k==='moonlight'||c.k==='polaris');
+        var priceHTML='<span class="bed-from">From</span>'
+          + '<span class="bed-now">$'+now.toFixed(2)+'</span>'
+          + (onSale?'<span class="bed-was">$'+was.toFixed(2)+'</span><span class="bed-save">Save '+save+'%</span>':'');
+        var hero=(window.NOTTERA_CASE_HERO||{})[c.k];
+        var isSig=SIGNATURE.indexOf(c.k)>-1;
+        h+='<article class="bed-card" data-fab="'+f.k+'" data-color="'+c.k+'">'
+         +'<a class="bed-clink" href="#/pc'+f.k+c.k+'">'
+         +'<div class="bed-thumb'+(c.light?' is-light':'')+'"'+(hero?'':' style="background:'+c.sw+'"')+'>'+(hero?'<img class="bed-thumb-img" src="'+hero+'" alt="'+c.name+' pillowcase" loading="lazy">':'')
+           +'<span class="bed-thumb-tag">'+f.name+'</span>'
+           +(isSig?'<span class="bed-thumb-sig">Nottera Signature</span>':'')
+           +(isSig?'<span class="bed-thumb-limited">Limited time offer</span>':'')
+         +'</div>'
+         +'<div class="bed-cbody">'
+         +'<h3 class="bed-cname">'+c.name+'</h3>'
+         +'<p class="bed-cmeta">'+f.name+' pillowcase &middot; Crescent &amp; Eclipse</p>'
+         +'<p class="bed-price">'+priceHTML+'</p>'
+         +'<span class="btn btn-primary bed-choosesize">Choose size</span>'
+         +'</div></a></article>';
+      });
+    });
+    return h;
+  }
+  function checks(type,arr,dot){
+    return arr.map(function(o){
+      var d=dot?'<span class="bed-dot'+(o.light?' is-light':'')+'" style="background:'+o.sw+'"></span>':'';
+      return '<label class="bed-check"><input type="checkbox" class="bed-filter" data-type="'+type+'" value="'+o.k+'">'+d+'<span>'+o.name+'</span></label>';
+    }).join('');
+  }
+  function buildBed(root){
+    root.innerHTML=
+      '<p class="bed-lead">Pillowcases you can buy on their own — a cool, silky-smooth ice-silk case cut to fit every Nottera pillow. Begin with a colour.</p>'
+      +'<button class="bed-ftoggle" type="button" id="bedFilterToggle"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" aria-hidden="true"><path d="M4 6h16M8 12h8M11 18h2"/></svg><span>Filters</span></button>'
+      +'<div class="bed-layout">'
+      +'<aside class="bed-filters" id="bedFiltersPanel">'
+      +'<button class="bed-fclose" type="button" id="bedFilterClose" aria-label="Close filters">&times;</button>'
+      +'<div class="bed-fhead">Filters</div>'
+      +'<div class="bed-fgroup"><span class="bed-flabel">Colour</span>'+checks('color',COLORS,true)+'</div>'
+      /* No size filter: every colour comes in both sizes, so filtering by size
+         would never narrow the grid. Size is picked on the product page. */
+      +'<button class="bed-clear" type="button" data-bed-clear>Clear all</button>'
+      +'<button class="btn btn-primary bed-fapply" type="button" id="bedFilterApply">Show results</button>'
+      +'</aside>'
+      +'<div class="bed-main"><p class="bed-count" id="bedCount"></p><div class="bed-grid" id="bedGrid">'+cards()+'</div></div>'
+      +'</div>';
+  }
+  function checkedVals(type){
+    return Array.prototype.slice.call(document.querySelectorAll('.bed-filter[data-type="'+type+'"]:checked')).map(function(x){return x.value;});
+  }
+  function bedApply(){
+    var grid=document.getElementById('bedGrid'); if(!grid) return;
+    var fabs=checkedVals('fab'),cols=checkedVals('color'),n=0;
+    Array.prototype.forEach.call(grid.children,function(card){
+      var show=(!fabs.length||fabs.indexOf(card.dataset.fab)>-1)&&(!cols.length||cols.indexOf(card.dataset.color)>-1);
+      card.style.display=show?'':'none'; if(show)n++;
+    });
+    var cnt=document.getElementById('bedCount'); if(cnt)cnt.textContent=n+(n===1?' colour':' colours');
+    var active=fabs.length===1?fabs[0]:null;
+    Array.prototype.forEach.call(document.querySelectorAll('.bed-fabtile'),function(t){t.classList.toggle('is-active',t.dataset.fab===active);});
+    var va=document.querySelector('.bed-viewall'); if(va)va.classList.toggle('show',!!(fabs.length||cols.length));
+  }
+  function setFabric(v){
+    Array.prototype.forEach.call(document.querySelectorAll('.bed-filter[data-type="fab"]'),function(cb){cb.checked=(cb.value===v);});
+    bedApply();
+    var grid=document.getElementById('bedGrid'); if(grid)grid.scrollIntoView({behavior:'smooth',block:'start'});
+  }
+  document.addEventListener('change',function(e){
+    if(e.target&&e.target.classList&&e.target.classList.contains('bed-filter')) bedApply();
+  });
+  document.addEventListener('click',function(e){
+    if(!e.target||!e.target.closest) return;
+    var tile=e.target.closest('.bed-fabtile');
+    if(tile){var v=tile.dataset.fab;var cur=document.querySelector('.bed-filter[data-type="fab"][value="'+v+'"]');
+      if(cur&&cur.checked){cur.checked=false;bedApply();}else{setFabric(v);} return;}
+    var va=e.target.closest('[data-bed-viewall]');
+    if(va){Array.prototype.forEach.call(document.querySelectorAll('.bed-filter'),function(cb){cb.checked=false;}); bedApply(); return;}
+    var clr=e.target.closest('[data-bed-clear]');
+    if(clr){Array.prototype.forEach.call(document.querySelectorAll('.bed-filter'),function(cb){cb.checked=false;}); bedApply(); return;}
+    var add=e.target.closest('.bed-add');
+    if(add&&window.NotteraCart){window.NotteraCart.add(add.dataset.add,add.dataset.variant||'',1);}
+  });
+  function ensureBed(){
+    if(location.hash!=='#/bed') return;
+    var r=document.getElementById('bedRoot');
+    if(r&&!r.dataset.built){buildBed(r); r.dataset.built='1'; bedApply();}
+  }
+  addEventListener('hashchange',function(){setTimeout(ensureBed,0);});
+  if(document.readyState==='complete'){setTimeout(ensureBed,0);}else{addEventListener('load',function(){setTimeout(ensureBed,0);});}
+})();
+</script>
+<!-- ============ PASS 1: cleanup + Shop dropdown + Pillows page + collapsible filters ============ -->
+<style>
+/* nav dropdown */
+.nav-drop{position:relative;display:inline-block}
+.nav-drop-toggle{background:none;border:none;color:inherit;font:inherit;cursor:pointer;padding:0;letter-spacing:inherit;display:inline-flex;align-items:center;gap:.35rem}
+.nav-drop-toggle::after{content:'';width:6px;height:6px;border-right:1.5px solid currentColor;border-bottom:1.5px solid currentColor;transform:rotate(45deg) translateY(-1px);opacity:.65;transition:transform .3s var(--ease)}
+.nav-drop.open .nav-drop-toggle::after{transform:rotate(-135deg)}
+.nav-drop-menu{position:absolute;top:100%;left:50%;transform:translateX(-50%);min-width:180px;padding-top:1.4rem;background:transparent;opacity:0;visibility:hidden;transition:opacity .25s var(--ease);z-index:60}
+.nav-drop.open .nav-drop-menu,.nav-drop:focus-within .nav-drop-menu{opacity:1;visibility:visible}@media (hover:hover) and (pointer:fine){.nav-drop:hover .nav-drop-menu{opacity:1;visibility:visible}}
+.nav-drop-menu a{padding:.6rem .8rem;border-radius:8px;font-size:.9rem;color:var(--fg-soft);white-space:nowrap;transition:background .2s,color .2s}
+.nav-drop-menu a:hover{background:rgba(255,255,255,.05);color:var(--fg)}
+
+/* collapsible filter groups */
+.bed-flabel{cursor:pointer;display:flex;align-items:center;justify-content:space-between;user-select:none}
+.bed-flabel::after{content:'';width:7px;height:7px;border-right:1.5px solid currentColor;border-bottom:1.5px solid currentColor;transform:rotate(45deg);opacity:.55;transition:transform .3s var(--ease)}
+.bed-fgroup.is-collapsed .bed-flabel::after{transform:rotate(-135deg)}
+.bed-fgroup.is-collapsed .bed-check{display:none}
+
+/* Pillows best-seller page */
+.pil-wrap{width:min(1080px,92vw);margin-left:50%;transform:translateX(-50%);display:grid;grid-template-columns:1fr 1fr;gap:3rem;align-items:start}
+.pil-media{position:relative}
+.pil-ph{
+  aspect-ratio:4/3;border-radius:18px;position:relative;overflow:hidden;
+  background:
+    radial-gradient(120% 100% at 50% 12%, rgba(255,255,255,.6) 0%, rgba(237,232,223,0) 58%),
+    linear-gradient(180deg,#EDE8DF 0%,#E2DBCC 100%);
+  box-shadow: inset 0 0 70px rgba(30,24,14,.10), 0 34px 64px rgba(8,19,32,.38);
+}
+.pil-ph::after{
+  content:'';position:absolute;left:50%;bottom:9%;transform:translateX(-50%);
+  width:58%;height:13%;border-radius:50%;
+  background:radial-gradient(ellipse at center, rgba(20,15,8,.22), rgba(20,15,8,0) 72%);
+  filter:blur(2px);pointer-events:none;
+}
+.pil-media-img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;border-radius:inherit;z-index:1}
+.pil-badge{position:absolute;top:1rem;left:1rem;font-size:.62rem;font-weight:700;letter-spacing:.16em;text-transform:uppercase;color:#0e1420;background:var(--gold);padding:.35rem .7rem;border-radius:40px;z-index:2}
+.pil-eyebrow{font-size:.68rem;font-weight:600;letter-spacing:.16em;text-transform:uppercase;color:var(--fg-soft);margin:0 0 .5rem}
+.pil-name{font-family:var(--serif);font-weight:500;font-size:2.2rem;margin:0 0 .5rem;color:var(--fg)}
+.pil-rating{font-size:.85rem;color:var(--gold);margin:0 0 1rem}
+.pil-rating>span:last-child{color:var(--fg-soft);margin-left:.4rem}
+.pil-lead{color:var(--fg-soft);font-size:clamp(1rem, 1.4vw, 1.15rem);line-height:1.75;margin:0 0 1.6rem;max-width:34em}
+.pil-sizes{display:flex;gap:.8rem;margin-bottom:1.1rem}
+.pil-size{flex:1;background:rgba(255,255,255,.03);border:1px solid var(--fg-faint);border-radius:12px;padding:.8rem 1rem;cursor:pointer;color:var(--fg-soft);display:flex;flex-direction:column;gap:.15rem;transition:border-color .25s,color .25s}
+.pil-size strong{color:var(--fg);font-weight:600;font-size:1rem}
+.pil-size span{font-size:.72rem;letter-spacing:.08em;text-transform:uppercase}
+.pil-size.is-active{border-color:var(--gold);color:var(--fg)}
+.pil-dim{font-size:.85rem;color:var(--fg-soft);margin:0 0 1rem}
+.pil-add{width:100%;padding:.9rem;font-size:.74rem;border:none;cursor:pointer;margin:.4rem 0 .6rem}
+.btn-shop{width:100%;display:flex;align-items:center;justify-content:center;gap:.5rem;background:#5a31f4;color:#fff;border:none;border-radius:8px;padding:.85rem;font-size:.78rem;font-weight:700;cursor:pointer;margin:0 0 1.2rem;transition:background .25s var(--ease)}
+.btn-shop:hover{background:#4a27d1}
+.btn-shop .shop-mark{width:19px;height:19px;flex-shrink:0}
+.btn-shop b{font-weight:800}
+.btn-shop .pay-tag{font-weight:400;opacity:.85;margin-left:-.15rem}
+.pil-faq{border-top:1px solid var(--fg-faint);padding-top:.2rem;margin-bottom:.2rem}
+.pil-faq-title{font-size:.68rem;letter-spacing:.2em;text-transform:uppercase;color:var(--fg-soft);margin:1rem 0 .2rem}
+.pil-faq .pil-acc-body{font-size:.88rem}
+.pil-trust{list-style:none;display:flex;flex-wrap:wrap;gap:1.2rem;padding:0;margin:0 0 1.8rem;font-size:.76rem;color:var(--fg-soft)}
+.pil-trust li{position:relative;padding-left:1.1rem}
+.pil-trust li::before{content:'✓';position:absolute;left:0;color:var(--gold)}
+.pil-acc{border-top:1px solid var(--fg-faint)}
+.pil-acc-item{border-bottom:1px solid var(--fg-faint)}
+.pil-acc-head{width:100%;background:none;border:none;color:var(--fg);font:inherit;font-size:.95rem;font-weight:600;text-align:left;padding:1.05rem 0;cursor:pointer;display:flex;justify-content:space-between;align-items:center}
+.pil-acc-head::after{content:'';width:8px;height:8px;border-right:1.5px solid currentColor;border-bottom:1.5px solid currentColor;transform:rotate(45deg);opacity:.55;transition:transform .3s var(--ease)}
+.pil-acc-item.open .pil-acc-head::after{transform:rotate(-135deg)}
+.pil-acc-body{display:none;padding:0 0 1.1rem;color:var(--fg-soft);font-size:clamp(1rem, 1.4vw, 1.15rem);line-height:1.8}
+.pil-acc-item.open .pil-acc-body{display:block}
+.pil-acc-body table{width:100%;border-collapse:collapse}
+.pil-acc-body td{padding:.35rem 0;vertical-align:top}
+.pil-acc-body td:first-child{color:var(--fg);font-weight:600;width:42%;padding-right:1rem}
+@media (max-width:760px){.pil-wrap{grid-template-columns:1fr;gap:1.6rem}}
+</style>
+<script>
+(function(){
+
+  /* --- Shop nav dropdown (mobile tap) --- */
+  document.addEventListener('click',function(e){
+    var t=e.target.closest&&e.target.closest('.nav-drop-toggle');
+    var drop=document.querySelector('.nav-drop');
+    if(t&&drop){e.preventDefault();drop.classList.toggle('open');t.setAttribute('aria-expanded',drop.classList.contains('open'));return;}
+    if(drop&&!e.target.closest('.nav-drop')) drop.classList.remove('open');
+    if(e.target.closest&&e.target.closest('.nav-drop-menu a')&&drop) drop.classList.remove('open');
+  });
+
+  /* --- collapsible filter groups --- */
+  document.addEventListener('click',function(e){
+    var lb=e.target.closest&&e.target.closest('.bed-flabel');
+    if(lb&&lb.parentElement) lb.parentElement.classList.toggle('is-collapsed');
+  });
+
+  /* --- Pillows best-seller page (#/pillow) --- */
+  var PIL={
+    crescent:{name:'Crescent',sub:'Standard',now:69.99,was:89.99,dim:'21.7 × 13.8 in (55 × 35 cm)',loft:'High side 3.9 in (10 cm) · Low side 2.8 in (7 cm)',id:'pillowcrescent',img:'{{ 'nt2-f821f796be.jpg' | asset_url }}'},
+    eclipse:{name:'Eclipse',sub:'Oversized',now:84.99,was:109.99,dim:'23.6 × 15.7 in (60 × 40 cm)',loft:'High side 4.7 in (12 cm) · Low side 3.9 in (10 cm)',id:'pilloweclipse',img:'{{ 'nt2-c5335e4661.jpg' | asset_url }}'}
+  };
+  var PIL_GALLERY={
+    crescent:[
+      {src:'{{ 'nt2-cb5a0b48c5.jpg' | asset_url }}',alt:'The Nottera Pillow, Crescent'},
+      {src:'{{ 'nt2-0f25a23323.jpg' | asset_url }}',alt:'A man sleeping on the Nottera Crescent pillow, side profile'},
+      {src:'https://cdn.shopify.com/s/files/1/1049/5367/6116/files/IMG_2312.png?v=1788465969',alt:'A hand pressing into the Nottera pillow, showing the memory foam contour'},
+      {src:'https://cdn.shopify.com/s/files/1/1049/5367/6116/files/nt-bed-cropped.jpg?v=1788466165',alt:'An unmade bed with the Nottera Crescent pillow'}
+    ],
+    eclipse:[
+      {src:'{{ 'nt2-a382880e5c.jpg' | asset_url }}',alt:'The Nottera Pillow, Eclipse'},
+      {src:'{{ 'nt2-be8cbbc3a4.jpg' | asset_url }}',alt:'A couple in bed, each resting on their own Nottera Eclipse pillow'},
+      {src:'{{ 'nt2-ad4fe24995.jpg' | asset_url }}',alt:'A hand pressing into the Nottera pillow, showing the memory foam contour'},
+      {src:'{{ 'nt2-ebe1e7f830.jpg' | asset_url }}',alt:'Overhead view of the Nottera Eclipse pillow'}
+    ]
+  };
+  window.NOTTERA_QUIZ_GIRL_IMG = '{{ 'nt2-223f1939bf.jpg' | asset_url }}';
+  window.NOTTERA_PILLOW_HERO = {crescent: PIL.crescent.img, eclipse: PIL.eclipse.img};
+  function fillHomeShopCards(){
+    var media = document.querySelectorAll('.shop-card-media');
+    if(media[0] && !media[0].querySelector('img')){
+      var i0=document.createElement('img'); i0.className='shop-card-photo'; i0.alt='The Nottera Pillow — Crescent'; i0.loading='lazy'; i0.src=PIL.crescent.img;
+      media[0].insertBefore(i0, media[0].firstChild);
+    }
+    if(media[1] && !media[1].querySelector('img')){
+      var i1=document.createElement('img'); i1.className='shop-card-photo'; i1.alt='The Nottera Pillow — Eclipse'; i1.loading='lazy'; i1.src=PIL.eclipse.img;
+      media[1].insertBefore(i1, media[1].firstChild);
+    }
+  }
+  function fillQuizPhoto(){
+    var wrap=document.getElementById('quizPhotoWrap');
+    if(wrap && !wrap.querySelector('img') && window.NOTTERA_QUIZ_GIRL_IMG){
+      var im=document.createElement('img'); im.className='size-quiz-photo'; im.alt='Choosing the right Nottera pillow size'; im.loading='lazy'; im.src=window.NOTTERA_QUIZ_GIRL_IMG;
+      wrap.appendChild(im);
+    }
+  }
+  if(document.readyState==='complete'){fillHomeShopCards();fillQuizPhoto();}else{addEventListener('load',function(){fillHomeShopCards();fillQuizPhoto();});}
+  function accItem(t,b,open){return '<div class="pil-acc-item'+(open?' open':'')+'"><button type="button" class="pil-acc-head">'+t+'</button><div class="pil-acc-body">'+b+'</div></div>';}
+  function pilGalleryHTML(k){
+    var list=PIL_GALLERY[k]||PIL_GALLERY.crescent;
+    var slides='',thumbs='';
+    list.forEach(function(im,i){
+      slides+='<div class="pdp2-slide pil-slide'+(i===0?' is-on':'')+'" data-i="'+i+'"><img class="pdp2-slide-img" src="'+im.src+'" alt="'+im.alt+'" loading="lazy"></div>';
+      thumbs+='<button class="pdp2-thumb pil-thumb'+(i===0?' is-on':'')+'" type="button" data-i="'+i+'" style="background:#f7f5f1"><img src="'+im.src+'" alt="" loading="lazy" style="width:100%;height:100%;object-fit:cover"></button>';
+    });
+    return '<div class="pdp2-gallery pil-gallery" id="pilGallery">'
+      +'<div class="pdp2-main"><span class="pil-badge">Best seller</span>'+slides+'<button class="pdp2-arrow prev" type="button" data-pil-prev aria-label="Previous">‹</button><button class="pdp2-arrow next" type="button" data-pil-next aria-label="Next">›</button></div>'
+      +'<div class="pdp2-thumbs">'+thumbs+'</div>'
+      +'</div>';
+  }
+  function pilGoSlide(i){
+    var root=document.getElementById('pilGallery'); if(!root) return;
+    var slides=root.querySelectorAll('.pil-slide'), thumbs=root.querySelectorAll('.pil-thumb');
+    if(!slides.length) return; var n=slides.length; i=((i%n)+n)%n;
+    Array.prototype.forEach.call(slides,function(s,k){s.classList.toggle('is-on',k===i);});
+    Array.prototype.forEach.call(thumbs,function(t,k){t.classList.toggle('is-on',k===i);});
+  }
+  function pilCurSlide(){
+    var root=document.getElementById('pilGallery'); var on=root&&root.querySelector('.pil-slide.is-on');
+    return on?parseInt(on.dataset.i,10):0;
+  }
+  function volTiersHTML(unit){
+    function row(qty,label,sub,badge,pct){
+      var price=pct?unit*qty*(1-pct/100):unit*qty;
+      var was=pct?'<s>$'+(unit*qty).toFixed(2)+'</s>':'';
+      return '<button class="voltier'+(qty===1?' is-active':'')+'" type="button" data-vol="'+qty+'">'
+        +(badge?'<span class="voltier-badge">'+badge+'</span>':'')
+        +'<span class="voltier-radio"></span>'
+        +'<span class="voltier-body"><span class="voltier-label">'+label+'</span><span class="voltier-sub">'+sub+'</span></span>'
+        +'<span class="voltier-price"><b>$'+price.toFixed(2)+'</b>'+was+'</span>'
+        +'</button>';
+    }
+    return '<div class="voltiers"><span class="vol-label">Buy more, save more</span><div class="voltiers-grid">'
+      +row(1,'Single','1 pillow','','')
+      +row(2,'Duo','2 pillows','Most popular',10)
+      +row(3,'Trio','3 pillows','Best value',15)
+      +'</div></div>';
+  }
+  function buildPillow(root){
+    var specs='<table>'
+      +'<tr><td>Type</td><td>Ergonomic cervical contour, dual-height loft</td></tr>'
+      +'<tr><td>Core</td><td>High-density slow-rebound memory foam (3&ndash;5s recovery)</td></tr>'
+      +'<tr><td>Foam density</td><td>&asymp;48D (kg/m&sup3;) &mdash; holds its shape for years, not months</td></tr>'
+      +'<tr><td>Support zones</td><td>Central head cradle · contoured neck ridge · shoulder wings</td></tr>'
+      +'<tr><td>Airflow</td><td>Open-cell foam, channelled for a cooler night</td></tr>'
+      +'<tr><td>Cover</td><td>Breathable knit (polyester-spandex face) &mdash; removable &amp; machine-washable</td></tr>'
+      +'<tr><td>Cover fiber content</td><td>95% polyester, 5% spandex</td></tr>'
+      +'<tr><td>Cover fabric weight</td><td>320 g/m&sup2;</td></tr>'
+      +'<tr><td>Country of Origin</td><td>Imported</td></tr>'
+      +'<tr><td>Firmness</td><td>Medium &mdash; adapts to warmth &amp; weight</td></tr>'
+      +'<tr><td>Loft (dual-height)</td><td id="pilLoft">'+PIL.crescent.loft+'</td></tr>'
+      +'<tr><td>Weight</td><td>Crescent 0.55 kg (1.2 lb) &middot; Eclipse 0.9 kg (2.0 lb)</td></tr>'
+      +'<tr><td>Best for</td><td>Back, side &amp; stomach sleepers</td></tr>'
+      +'</table>';
+    var dims='<table><tr><td>Crescent (Standard)</td><td>21.7 × 13.8 in — 55 × 35 cm</td></tr><tr><td>Eclipse (Oversized)</td><td>23.6 × 15.7 in — 60 × 40 cm</td></tr></table><p style="margin:.8rem 0 0;font-style:italic;opacity:.7">Sized to fit our ice-silk pillowcases. Final production dimensions may vary slightly.</p>';
+    root.innerHTML='<div class="pil-wrap">'
+      +'<div class="pil-media">'+pilGalleryHTML('crescent')+'</div>'
+      +'<div class="pil-info">'
+      +'<p class="pil-eyebrow">Ergonomic cervical pillow</p>'
+      +'<h2 class="pil-name">The Nottera Pillow</h2>'
+      +'<div class="jdgm-widget jdgm-preview-badge" data-id="15698449662292" data-product-title="The Nottera Pillow"></div>'
+      +'<p class="pil-rating"><span>60-night trial &middot; 3-year warranty</span></p>'
+      +'<p class="pil-lead">A memory-foam contour that cradles your neck and shoulders in every position — engineered for deeper sleep and calmer mornings.</p>'
+      +'<div class="pil-sizes">'
+        +'<button class="pil-size is-active" type="button" data-size="crescent"><strong>Crescent</strong><span>Standard</span></button>'
+        +'<button class="pil-size" type="button" data-size="eclipse"><strong>Eclipse</strong><span>Oversized</span></button>'
+      +'</div>'
+      +'<p class="pil-dim" id="pilDim">Dimensions: '+PIL.crescent.dim+'</p>'
+      +'<p class="bed-price"><span class="bed-now" id="pilNow">$'+PIL.crescent.now.toFixed(2)+'</span></p>'
+      +'<button class="btn btn-primary bed-add pil-add" type="button" id="pilAdd" data-add="pillowcrescent" data-variant="Nottera Pillow · Crescent">Add to night</button>'
+      +'<button class="btn btn-shop pil-shop" type="button" id="pilShop" data-add="pillowcrescent" data-variant="Nottera Pillow · Crescent" aria-label="Buy now with Shop Pay"><svg class="shop-mark" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M16.2 7.1V6.4a4.2 4.2 0 0 0-8.4 0v.7H5.7a1 1 0 0 0-1 .9L3.6 18.9A1 1 0 0 0 4.6 20h14.8a1 1 0 0 0 1-1.1L19.3 8a1 1 0 0 0-1-.9h-2.1Zm-6.4-.7a2.2 2.2 0 1 1 4.4 0v.7H9.8v-.7Zm-.3 5.3a1.1 1.1 0 1 1 0-2.2 1.1 1.1 0 0 1 0 2.2Zm6.9 0a1.1 1.1 0 1 1 0-2.2 1.1 1.1 0 0 1 0 2.2Z"/></svg>Buy with <b>shop</b><span class="pay-tag">Pay</span></button>'
+      +volTiersHTML(PIL.crescent.now)
+      +'<p class="secure-badge"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="5" y="10" width="14" height="10" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3"/></svg> Secure checkout &middot; SSL encrypted</p><div class="secure-badge-icons"><svg class="pay-mark-sm" viewBox="0 0 40 26" role="img" aria-label="Visa"><rect width="40" height="26" rx="4.2" fill="#fff"/><text x="20" y="17.6" text-anchor="middle" font-family="Manrope,Arial,Helvetica,sans-serif" font-size="10.2" font-weight="800" font-style="italic" letter-spacing=".4" fill="#1434CB">VISA</text></svg><svg class="pay-mark-sm" viewBox="0 0 40 26" role="img" aria-label="Mastercard"><rect width="40" height="26" rx="4.2" fill="#fff"/><circle cx="16.6" cy="13" r="6.6" fill="#EB001B"/><circle cx="23.4" cy="13" r="6.6" fill="#F79E1B"/><path d="M20 7.9a6.6 6.6 0 0 0 0 10.2 6.6 6.6 0 0 0 0-10.2Z" fill="#FF5F00"/></svg><svg class="pay-mark-sm" viewBox="0 0 40 26" role="img" aria-label="American Express"><rect width="40" height="26" rx="4.2" fill="#006FCF"/><text x="20" y="12.4" text-anchor="middle" font-family="Manrope,Arial,Helvetica,sans-serif" font-size="6.1" font-weight="800" letter-spacing=".2" fill="#fff">AMERICAN</text><text x="20" y="19.4" text-anchor="middle" font-family="Manrope,Arial,Helvetica,sans-serif" font-size="6.1" font-weight="800" letter-spacing=".2" fill="#fff">EXPRESS</text></svg><svg class="pay-mark-sm" viewBox="0 0 40 26" role="img" aria-label="PayPal"><rect width="40" height="26" rx="4.2" fill="#fff"/><text x="20" y="17.2" text-anchor="middle" font-family="Manrope,Arial,Helvetica,sans-serif" font-size="9.4" font-weight="800" letter-spacing="-.2"><tspan fill="#003087">Pay</tspan><tspan fill="#009CDE">Pal</tspan></text></svg><svg class="pay-mark-sm" viewBox="0 0 40 26" role="img" aria-label="Apple Pay"><rect width="40" height="26" rx="4.2" fill="#fff"/><g fill="#000"><path d="M12.62 9.05c.3-.37.5-.88.44-1.39-.44.02-.97.29-1.28.66-.28.33-.53.85-.46 1.35.49.04.99-.25 1.3-.62Zm.44.71c-.71-.04-1.31.4-1.65.4-.34 0-.86-.38-1.41-.37-.73.01-1.4.42-1.77 1.07-.75 1.31-.2 3.25.54 4.31.36.52.79 1.11 1.35 1.09.54-.02.74-.35 1.39-.35.65 0 .83.35 1.4.34.58-.01.94-.53 1.3-1.06.41-.6.58-1.19.59-1.22-.01-.01-1.13-.44-1.14-1.73-.01-1.08.88-1.6.92-1.63-.5-.74-1.29-.83-1.57-.85Z"/><text x="23.6" y="17.4" text-anchor="middle" font-family="Manrope,Arial,Helvetica,sans-serif" font-size="9.6" font-weight="600" letter-spacing="-.1">Pay</text></g></svg><svg class="pay-mark-sm" viewBox="0 0 40 26" role="img" aria-label="Shop Pay"><rect width="40" height="26" rx="4.2" fill="#5a31f4"/><text x="20" y="17" text-anchor="middle" font-family="Manrope,Arial,Helvetica,sans-serif" font-size="7.4" font-weight="800" letter-spacing="-.1" fill="#fff">shop<tspan font-weight="400">Pay</tspan></text></svg></div>'
+      +'<ul class="pil-trust"><li>Ships in 7&ndash;14 business days</li><li>Free shipping, no minimum</li><li>60-night trial</li><li>3-year warranty</li></ul>'
+      +'<div class="pil-faq"><p class="pil-faq-title">Common questions</p>'
+        +accItem('Will this help my neck and shoulders?','<p>Nottera is built to support a neutral neck position and take pressure off your shoulders while you sleep. It&rsquo;s a comfort product, not a medical device &mdash; if you have ongoing pain, please see a doctor.</p>',false)
+        +accItem('What if I don&rsquo;t love it?','<p>Sleep on it for up to 60 nights. If it isn&rsquo;t right, send it back for a full refund.</p>',false)
+        +accItem('Which size should I get?','<p>Crescent suits most side and back sleepers. Eclipse is our oversized option, popular with stomach sleepers and anyone who likes extra room. Not sure? <a href="#sizeQuiz">Take the 30-second quiz</a>.</p>',false)
+        +accItem('How do I clean it?','<p>The knit cover unzips and is machine-washable cold &mdash; air-dry it. Never wash the foam core itself; spot-clean and air it out.</p>',false)
+      +'</div>'
+      +'<div class="pil-acc">'
+        +accItem('Details','<p>A true ergonomic cervical contour, sculpted to keep your spine in a neutral line all night. A central cavity cradles your head, a raised ridge supports the natural curve of your neck, and gentle side wings give your shoulder and arm room to rest. Do the <strong>Phase Flip</strong> for a higher or lower loft &mdash; the slow-rebound memory foam softens to your shape under warmth and weight, then recovers by morning.</p>',true)
+        +accItem('Dimensions',dims,false)
+        +accItem('Materials &amp; Care','<p>A high-density, slow-rebound memory-foam core with an open-cell structure that channels airflow to sleep cool. The breathable knit cover unzips and is machine-washable cold &mdash; air-dry it. Never soak or machine-wash the foam core; spot-clean and air it out, away from direct sun.</p>',false)
+        +accItem('Specifications',specs,false)
+        +accItem('Shipping &amp; Returns','<p>Free shipping on every pillow, no minimum. Sleep on it for up to 60 nights &mdash; if it isn’t right, return it for a full refund. Returned pillows are donated, never resold.</p>',false)
+        +accItem('Warranty','<p>3-year limited warranty against manufacturing defects — not everyday wear or misuse.</p>',false)
+      +'</div>'
+      +'</div></div>';
+  }
+  function selectSize(k){
+    var d=PIL[k]; if(!d) return;
+    var now=document.getElementById('pilNow'),dim=document.getElementById('pilDim'),add=document.getElementById('pilAdd'),shop=document.getElementById('pilShop'),loft=document.getElementById('pilLoft'),media=document.querySelector('.pil-media');
+    if(now)now.textContent='$'+d.now.toFixed(2);
+    if(dim)dim.textContent='Dimensions: '+d.dim;
+    if(loft)loft.textContent=d.loft;
+    if(add){add.dataset.add=d.id;add.dataset.variant='Nottera Pillow · '+d.name;}
+    if(shop){shop.dataset.add=d.id;shop.dataset.variant='Nottera Pillow · '+d.name;}
+    if(media)media.innerHTML=pilGalleryHTML(k);
+    var vt=document.querySelector('.pil-info .voltiers'); if(vt){var w=document.createElement('div'); w.innerHTML=volTiersHTML(d.now); vt.replaceWith(w.firstChild);}
+  }
+  document.addEventListener('click',function(e){
+    if(!e.target||!e.target.closest) return;
+    var sz=e.target.closest('.pil-size');
+    if(sz){Array.prototype.forEach.call(document.querySelectorAll('.pil-size'),function(b){b.classList.toggle('is-active',b===sz);}); selectSize(sz.dataset.size); return;}
+    var ah=e.target.closest('.pil-acc-head');
+    if(ah&&ah.parentElement){ah.parentElement.classList.toggle('open'); return;}
+    var pprev=e.target.closest('.pil-gallery [data-pil-prev]');
+    if(pprev){pilGoSlide(pilCurSlide()-1); return;}
+    var pnext=e.target.closest('.pil-gallery [data-pil-next]');
+    if(pnext){pilGoSlide(pilCurSlide()+1); return;}
+    var pthumb=e.target.closest('.pil-thumb');
+    if(pthumb){pilGoSlide(parseInt(pthumb.dataset.i,10)); return;}
+    var pshop=e.target.closest('.pil-shop');
+    if(pshop&&window.NotteraCart){window.NotteraCart.add(pshop.dataset.add,pshop.dataset.variant,1); if(window.NotteraCart.open)window.NotteraCart.open(); return;}
+    var pvb=e.target.closest('.pil-info .voltier');
+    if(pvb){
+      Array.prototype.forEach.call(document.querySelectorAll('.pil-info .voltier'),function(b){b.classList.toggle('is-active',b===pvb);});
+      var pqty=parseInt(pvb.getAttribute('data-vol'),10);
+      var padd=document.getElementById('pilAdd'), pnow=document.getElementById('pilNow');
+      if(padd&&pnow&&window.NotteraCart){
+        var punit=parseFloat(pnow.textContent.replace(/[^0-9.]/g,''))||0;
+        if(pqty<=1){
+          window.NotteraCart.add(padd.dataset.add,padd.dataset.variant,1);
+        }else{
+          var ppct=pqty>=3?15:10;
+          var pdisc=+(punit*(1-ppct/100)).toFixed(2);
+          window.NotteraCart.add(padd.dataset.add,padd.dataset.variant,pqty,{price:pdisc,requires:null,minQty:pqty,keySuffix:'vol-'+padd.dataset.variant,note:'Volume · '+ppct+'% off'});
+        }
+        if(window.NotteraCart.open)window.NotteraCart.open();
+      }
+      return;
+    }
+  });
+  function ensurePillow(){
+    if(location.hash!=='#/pillow') return;
+    var r=document.getElementById('pillowRoot');
+    if(r&&!r.dataset.built){buildPillow(r); r.dataset.built='1';}
+    if(window.__pendingPillowSize){
+      var szBtn=document.querySelector('.pil-size[data-size="'+window.__pendingPillowSize+'"]');
+      if(szBtn)szBtn.click();
+      window.__pendingPillowSize=null;
+    }
+  }
+  addEventListener('hashchange',function(){setTimeout(ensurePillow,0);});
+  if(document.readyState==='complete'){setTimeout(ensurePillow,0);}else{addEventListener('load',function(){setTimeout(ensurePillow,0);});}
+})();
+
+/* ============ STICKY MINI-CART BAR (PDP) ============ */
+(function(){
+  var bar=null,io=null,target=null;
+  function ensureBar(){
+    if(bar) return bar;
+    bar=document.createElement('div');
+    bar.className='sticky-buybar';
+    bar.id='stickyBuybar';
+    bar.setAttribute('role','region');
+    bar.setAttribute('aria-label','Quick add');
+    bar.innerHTML='<div class="sb-id"><span class="sb-mark">N</span><div class="sb-text"><p class="sb-name" id="sbName"></p><p class="sb-price" id="sbPrice"></p></div></div><button class="btn btn-primary bed-add" type="button" id="sbAdd">Add to night</button>';
+    document.body.appendChild(bar);
+    return bar;
+  }
+  function sync(){
+    var t=document.getElementById('pilAdd'); if(!t) return;
+    ensureBar();
+    var nameEl=document.getElementById('sbName'),priceEl=document.getElementById('sbPrice'),addEl=document.getElementById('sbAdd'),priceSrc=document.getElementById('pilNow');
+    if(nameEl)nameEl.textContent='The Nottera Pillow';
+    if(priceEl)priceEl.textContent=priceSrc?priceSrc.textContent:'';
+    if(addEl){addEl.dataset.add=t.dataset.add;addEl.dataset.variant=t.dataset.variant;}
+  }
+  function watch(){
+    var t=document.getElementById('pilAdd');
+    if(!t){ if(bar)bar.classList.remove('show'); if(io&&target)io.unobserve(target); target=null; return; }
+    if(t===target){ sync(); return; }
+    if(io&&target)io.unobserve(target);
+    target=t; ensureBar(); sync();
+    if(!io){
+      io=new IntersectionObserver(function(entries){
+        entries.forEach(function(en){
+          var b=ensureBar();
+          if(en.isIntersecting){ b.classList.remove('show'); }
+          else if(en.boundingClientRect.top<0){ sync(); b.classList.add('show'); }
+          else { b.classList.remove('show'); }
+        });
+      },{threshold:0});
+    }
+    io.observe(t);
+  }
+  document.addEventListener('click',function(e){
+    if(!e.target||!e.target.closest) return;
+    if(e.target.closest('.pil-size'))setTimeout(sync,30);
+  });
+  addEventListener('hashchange',function(){setTimeout(watch,80);});
+  if(document.readyState==='complete'){setTimeout(watch,350);}else{addEventListener('load',function(){setTimeout(watch,350);});}
+})();
+</script>
+
+<!-- ============ PASS 2 fix: nav dropdown typography ============ -->
+<style>
+.nav-drop-toggle{font-size:0.78rem;font-weight:600;letter-spacing:0.22em;text-transform:uppercase;color:var(--fg-soft);transition:color 0.4s var(--ease),text-shadow 0.4s var(--ease)}
+.nav-drop:hover .nav-drop-toggle,.nav-drop.open .nav-drop-toggle{color:var(--fg)}
+.nav-drop-card{background:#0e1420;border:1px solid var(--fg-faint);border-radius:12px;padding:.5rem;display:flex;flex-direction:column;box-shadow:0 20px 50px rgba(0,0,0,.45);transform:translateY(6px);transition:transform .25s var(--ease)}.nav-drop.open .nav-drop-menu .nav-drop-card,.nav-drop:focus-within .nav-drop-menu .nav-drop-card{transform:translateY(0)}@media (hover:hover) and (pointer:fine){.nav-drop:hover .nav-drop-menu .nav-drop-card{transform:translateY(0)}}.nav-drop-menu a{font-size:0.72rem;font-weight:600;letter-spacing:0.2em;text-transform:uppercase}
+</style>
+
+
+<!-- ============ PASS 3: product pages (PDP) + favorites ============ -->
+<style>
+/* favorites in nav */
+.fav-toggle{position:relative;background:none;border:none;color:var(--fg-soft);cursor:pointer;padding:0;display:inline-flex;align-items:center;transition:color .3s var(--ease)}
+.fav-toggle:hover,.fav-toggle.active{color:var(--gold)}
+.fav-toggle svg{width:20px;height:20px}
+.fav-count{position:absolute;top:-7px;right:-9px;min-width:16px;height:16px;padding:0 4px;border-radius:9px;background:var(--gold);color:#0e1420;font-size:.62rem;font-weight:700;display:flex;align-items:center;justify-content:center}
+.fav-panel{position:fixed;top:0;right:0;height:100%;width:min(360px,90vw);background:#0e1420;border-left:1px solid var(--fg-faint);z-index:120;transform:translateX(100%);transition:transform .4s var(--ease);display:flex;flex-direction:column}
+.fav-panel.open{transform:translateX(0);box-shadow:-30px 0 60px rgba(0,0,0,.45)}
+.fav-phead{display:flex;align-items:center;justify-content:space-between;padding:1.6rem;border-bottom:1px solid var(--fg-faint)}
+.fav-ptitle{font-family:var(--serif);font-size:1.4rem;color:var(--fg)}
+.fav-pclose{background:none;border:none;color:var(--fg-soft);font-size:1.5rem;cursor:pointer;line-height:1}
+.fav-plist{flex:1;overflow-y:auto;padding:1rem 1.2rem}
+.fav-empty{color:var(--fg-soft);font-size:.9rem;padding:2rem 0;text-align:center}
+.fav-item{display:flex;align-items:center;gap:.9rem;padding:.8rem 0;border-bottom:1px solid var(--fg-faint)}
+.fav-sw{width:42px;height:42px;border-radius:9px;flex-shrink:0;box-shadow:0 0 0 1px var(--fg-faint);object-fit:cover}
+.fav-sw.is-light{box-shadow:0 0 0 1px rgba(0,0,0,.2)}
+.fav-iname{flex:1;min-width:0}
+.fav-iname a{color:var(--fg);font-weight:500;text-decoration:none;font-size:.95rem}
+.fav-iname a:hover{color:var(--gold)}
+.fav-imeta{font-size:.76rem;color:var(--fg-soft)}
+.fav-rm{background:none;border:none;color:var(--fg-soft);cursor:pointer;font-size:1.1rem}
+.fav-rm:hover{color:var(--gold)}
+
+/* PDP */
+.pdp2{width:min(1120px,92vw);margin-left:50%;transform:translateX(-50%);display:grid;grid-template-columns:1.05fr 1fr;gap:3.2rem;align-items:start}
+.pdp2-gallery{position:sticky;top:8rem}
+.pdp2-main{position:relative;aspect-ratio:1/1;border-radius:18px;overflow:hidden;background:#f7f5f1}
+.pil-gallery .pdp2-main{aspect-ratio:4/3}
+.pdp2-slide{position:absolute;inset:0;opacity:0;transition:opacity .4s var(--ease),transform .6s var(--ease);display:flex;align-items:flex-end;padding:1rem}
+.pdp2-slide-img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;border-radius:inherit;z-index:0}
+.pdp2-slide .pdp2-tag{position:relative;z-index:1}
+.pdp2-slide.is-on{opacity:1}
+
+.pdp2-tag{position:relative;z-index:2;font-size:.6rem;font-weight:600;letter-spacing:.16em;text-transform:uppercase;color:rgba(255,255,255,.9);background:rgba(0,0,0,.3);padding:.3rem .6rem;border-radius:40px}
+.pdp2-tag.is-light{color:rgba(0,0,0,.6);background:rgba(255,255,255,.55)}
+.pdp2-arrow{position:absolute;top:50%;transform:translateY(-50%);z-index:3;width:40px;height:40px;border-radius:50%;border:1px solid var(--fg-faint);background:rgba(14,20,32,.75);color:var(--fg);cursor:pointer;display:flex;align-items:center;justify-content:center;font-size:1.1rem;transition:background .25s,opacity .45s var(--ease),visibility .45s var(--ease)}
+/* tap the photo to fade the arrows away and see the image clean; tap again to bring them back */
+.pdp2-main.is-clean .pdp2-arrow{opacity:0;visibility:hidden;pointer-events:none}
+.pdp2-arrow:hover{background:rgba(14,20,32,.95)}
+.pdp2-arrow.prev{left:.8rem}.pdp2-arrow.next{right:.8rem}
+.pdp2-thumbs{display:flex;gap:.7rem;margin-top:.9rem}
+.pdp2-thumb{width:64px;height:64px;border-radius:10px;cursor:pointer;overflow:hidden;position:relative;opacity:.55;transition:opacity .25s,border-color .25s}
+.pdp2-thumb.is-on{opacity:1;outline:2px solid var(--gold);outline-offset:2px}
+.pdp2-eyebrow{font-size:.68rem;font-weight:600;letter-spacing:.16em;text-transform:uppercase;color:var(--fg-soft);margin:0 0 .5rem}
+.pdp2-title{font-family:var(--serif);font-weight:500;font-size:2.3rem;margin:0 0 .5rem;color:var(--fg)}
+.pdp2-rating{font-size:.85rem;color:var(--gold);margin:0 0 1.2rem}
+.pdp2-rating>span:last-child{color:var(--fg-soft);margin-left:.4rem}
+.pdp2-colour{display:flex;align-items:center;gap:.6rem;margin:0 0 1.4rem;font-size:.9rem;color:var(--fg-soft)}
+.pdp2-colour .bed-dot{width:20px;height:20px}
+.pdp2-colour a{color:var(--gold);text-decoration:none;font-size:.78rem;margin-left:.4rem}
+.pdp2-colour a:hover{text-decoration:underline}
+.pdp2-price{display:flex;align-items:baseline;gap:.7rem;flex-wrap:wrap;margin:0 0 1.6rem}
+.pdp2-now{font-size:1.6rem;font-weight:700;color:var(--fg)}
+.pdp2-was{font-size:1rem;color:var(--fg-soft);text-decoration:line-through}
+.pdp2-save{font-size:.66rem;font-weight:700;letter-spacing:.05em;color:#c0392b;border:1px solid var(--fg-faint);border-radius:40px;padding:.2rem .6rem}
+.pdp2-limited{font-size:.72rem;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:#c0392b;margin:-1rem 0 1.2rem;display:flex;align-items:center;gap:.4rem}
+.pdp2-stock{font-size:.78rem;font-weight:600;color:#c0392b;margin:-.6rem 0 1.2rem;display:flex;align-items:center;gap:.4rem}
+.pdp2-stock svg{width:15px;height:15px;flex-shrink:0}
+.sticky-buybar{position:fixed;left:0;right:0;bottom:0;z-index:80;display:flex;align-items:center;justify-content:space-between;gap:1rem;padding:.85rem 1.4rem;background:rgba(14,20,32,.96);backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px);border-top:1px solid var(--fg-faint);transform:translateY(120%);transition:transform .4s var(--ease)}
+.sticky-buybar.show{transform:translateY(0)}
+.sb-id{display:flex;align-items:center;gap:.7rem;min-width:0}
+.sb-mark{width:34px;height:34px;border-radius:50%;background:var(--gold);color:#0e1420;font-family:var(--serif);font-weight:700;font-size:1rem;display:flex;align-items:center;justify-content:center;flex-shrink:0}
+.sb-text{min-width:0}
+.sb-name{color:var(--fg);font-size:.82rem;font-weight:600;margin:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.sb-price{color:var(--fg-soft);font-size:.78rem;margin:0}
+.sticky-buybar .bed-add{width:auto;padding:.7rem 1.6rem;font-size:.68rem;flex-shrink:0}
+@media (max-width:520px){.sb-name{max-width:38vw}}
+.science-photo{width:min(900px,100%);margin:2.4rem auto 3rem;border-radius:20px;overflow:hidden;box-shadow:0 24px 60px rgba(8,19,32,.18)}
+.science-photo img{width:100%;height:auto;display:block}
+.sleep-pos-grid{width:min(1160px,100%);margin:2.8rem auto 0;display:grid;grid-template-columns:repeat(3,1fr);gap:1.6rem}
+.sleep-pos-item{display:flex;flex-direction:column;align-items:center;gap:1rem}
+.sleep-pos-photo{width:100%;border-radius:18px;overflow:hidden;box-shadow:0 20px 50px rgba(0,0,0,.35)}
+.sleep-pos-photo img{width:100%;height:auto;display:block}
+.sleep-pos-label{font-family:var(--serif);font-size:1.25rem;color:var(--fg);text-align:center}
+@media (max-width:820px){.sleep-pos-grid{grid-template-columns:1fr;max-width:440px}}
+.secure-badge{display:flex;align-items:center;gap:.5rem;font-size:.74rem;color:var(--fg-soft);margin:0 0 .5rem}
+.secure-badge svg{width:17px;height:17px;flex-shrink:0;color:var(--gold)}
+.secure-badge-icons{display:flex;flex-wrap:wrap;gap:.4rem;margin:0 0 1.3rem}
+.pay-mark-sm{width:32px;height:auto;border-radius:4.5px;box-shadow:0 0 0 1px rgba(199,205,214,.25)}
+.pdp2-flabel{font-size:.68rem;font-weight:700;letter-spacing:.16em;text-transform:uppercase;color:var(--fg-soft);margin:0 0 .6rem}
+.pdp2-sizes{display:flex;gap:.8rem;margin-bottom:1.5rem}
+.pdp2-size{flex:1;background:rgba(255,255,255,.03);border:1px solid var(--fg-faint);border-radius:12px;padding:.75rem 1rem;cursor:pointer;color:var(--fg-soft);display:flex;flex-direction:column;gap:.15rem;transition:border-color .25s,color .25s}
+.pdp2-size strong{color:var(--fg);font-weight:600}
+.pdp2-size span{font-size:.7rem;letter-spacing:.08em;text-transform:uppercase}
+.pdp2-size.is-active{border-color:var(--gold);color:var(--fg)}
+.pdp2-buyrow{display:flex;gap:.9rem;align-items:stretch;margin-bottom:1.4rem}
+.pdp2-qty{display:flex;align-items:center;border:1px solid var(--fg-faint);border-radius:40px;overflow:hidden}
+.pdp2-qty button{background:none;border:none;color:var(--fg);width:42px;height:100%;font-size:1.1rem;cursor:pointer}
+.pdp2-qty input{width:38px;text-align:center;background:none;border:none;color:var(--fg);font:inherit;font-size:.95rem;-moz-appearance:textfield}
+.pdp2-qty input::-webkit-outer-spin-button,.pdp2-qty input::-webkit-inner-spin-button{-webkit-appearance:none;margin:0}
+.pdp2-add{flex:1;border:none;cursor:pointer;padding:.9rem;font-size:.72rem;letter-spacing:.16em}
+.pdp2-fav{width:52px;border:1px solid var(--fg-faint);border-radius:12px;background:rgba(255,255,255,.03);color:var(--fg-soft);cursor:pointer;display:flex;align-items:center;justify-content:center;transition:color .25s,border-color .25s}
+.pdp2-fav:hover,.pdp2-fav.on{color:var(--gold);border-color:var(--gold)}
+.pdp2-fav svg{width:20px;height:20px}
+.pdp2-trust{list-style:none;display:flex;flex-wrap:wrap;gap:1.2rem;padding:0;margin:0 0 1.8rem;font-size:.76rem;color:var(--fg-soft)}
+.pdp2-trust li{position:relative;padding-left:1.1rem}
+.pdp2-trust li::before{content:'✓';position:absolute;left:0;color:var(--gold)}
+.pdp2-acc{border-top:1px solid var(--fg-faint)}
+.pdp2-acc-item{border-bottom:1px solid var(--fg-faint)}
+.pdp2-acc-head{width:100%;background:none;border:none;color:var(--fg);font:inherit;font-size:.95rem;font-weight:600;text-align:left;padding:1.05rem 0;cursor:pointer;display:flex;justify-content:space-between;align-items:center}
+.pdp2-acc-head::after{content:'';width:8px;height:8px;border-right:1.5px solid currentColor;border-bottom:1.5px solid currentColor;transform:rotate(45deg);opacity:.55;transition:transform .3s var(--ease)}
+.pdp2-acc-item.open .pdp2-acc-head::after{transform:rotate(-135deg)}
+.pdp2-acc-body{display:none;padding:0 0 1.1rem;color:var(--fg-soft);font-size:clamp(1rem, 1.4vw, 1.15rem);line-height:1.8}
+.pdp2-acc-item.open .pdp2-acc-body{display:block}
+.pdp2-acc-body table{width:100%;border-collapse:collapse}
+.pdp2-acc-body td{padding:.35rem 0;vertical-align:top}
+.pdp2-acc-body td:first-child{color:var(--fg);font-weight:600;width:40%;padding-right:1rem}
+.bed-card{cursor:pointer}
+@media (max-width:820px){.pdp2{grid-template-columns:1fr;gap:1.8rem}.pdp2-gallery{position:static}}
+</style>
+<script>
+(function(){
+  var COLORS={moonlight:{name:'Moonlight',sw:'#E0D2C3',light:true},nebula:{name:'Nebula',sw:'#62615F'},polaris:{name:'Polaris',sw:'#2A3858'},aurora:{name:'Aurora',sw:'#496C73'},venus:{name:'Venus',sw:'#F3AEC4',light:true}};
+  var CORDER=['moonlight','nebula','polaris','aurora','venus'];
+  var SIZES=[{k:'crescent',name:'Crescent',sub:'Standard',dim:'21.7 × 13.8 in (55 × 35 cm)'},{k:'eclipse',name:'Eclipse',sub:'Oversized',dim:'23.6 × 15.7 in (60 × 40 cm)'}];
+  var FABS={
+    ice:{name:'Ice-Silk',sizes:{crescent:[28.99,36.99],eclipse:[32.99,41.99]},ids:{crescent:'casecrescent',eclipse:'caseeclipse'},
+      lead:'A cool, silky-smooth case that glides against skin and hair — less friction, fewer creases, calmer mornings.',
+      details:'Woven from a cooling ice-silk fabric with a soft, fluid drape and a smooth, low-friction surface — gentle on hair and skin, and cool to the touch all night.',
+      specs:[['Material','Ice-silk weave'],['Fiber content','100% polyester (ice-silk finish)'],['Country of Origin','Imported'],['Finish','Silky, cool-to-touch'],['Closure','Hidden zipper'],['Feel','Cool, smooth, low-friction'],['Fits','Nottera contour pillow']],
+      care:'Machine wash cold on gentle with like colours. Tumble low or line dry. Do not bleach.'}
+  };
+  var HEART='<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="M12 20s-7-4.6-9.3-8.2C1 8.9 2.2 5.5 5.4 5.1 7.3 4.9 8.9 6 12 8.5 15.1 6 16.7 4.9 18.6 5.1c3.2.4 4.4 3.8 2.7 6.7C19 15.4 12 20 12 20z"/></svg>';
+  var HEARTF='<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 20s-7-4.6-9.3-8.2C1 8.9 2.2 5.5 5.4 5.1 7.3 4.9 8.9 6 12 8.5 15.1 6 16.7 4.9 18.6 5.1c3.2.4 4.4 3.8 2.7 6.7C19 15.4 12 20 12 20z"/></svg>';
+  try{ if(typeof GIFT!=='undefined'){ GIFT.id='pillowcrescent'; GIFT.requires=null; GIFT.deal=null; GIFT.tag='Complete your night'; GIFT.line='Add the Nottera Pillow to your set — the memory-foam support your neck will thank you for.'; GIFT.cta='Add pillow +'; } }catch(e){}
+  try{ if(typeof UPSELL!=='undefined'){ UPSELL.pillowcrescent={id:'casecrescent',tag:'Finish the set',line:'Add an ice-silk pillowcase — the softest way to rest on your Nottera.',deal:null,requires:null,cta:'Add case +'}; UPSELL.pilloweclipse={id:'caseeclipse',tag:'Finish the set',line:'Add an ice-silk pillowcase — the softest way to rest on your Nottera.',deal:null,requires:null,cta:'Add case +'}; } }catch(e){}
+
+  /* ---- register a routed page per fabric+colour so PAGES gives us the chrome ---- */
+  try{
+    if(typeof PAGES!=='undefined'){
+      Object.keys(FABS).forEach(function(f){ CORDER.forEach(function(c){
+        PAGES['pc'+f+c]={ nav:COLORS[c].name, kicker:FABS[f].name+' Pillowcase', title:COLORS[c].name, body:'<div class="pdp2root" data-fab="'+f+'" data-color="'+c+'"></div>' };
+      });});
+    }
+  }catch(e){}
+
+  var money=function(n){return '$'+n.toFixed(2);};
+  function saving(now,was){return Math.round((1-now/was)*100);}
+
+  window.NOTTERA_CASE_HERO = window.NOTTERA_CASE_HERO || {};
+  var PDP_IMAGES={
+    moonlight:{hero:'{{ 'nt2-fb65029e3d.jpg' | asset_url }}',second:'{{ 'nt2-83f5171d49.jpg' | asset_url }}',third:'{{ 'nt2-0624faac6c.jpg' | asset_url }}',fourth:'{{ 'nt2-1b79baa06a.jpg' | asset_url }}',fifth:'{{ 'nt2-977b4afdcd.jpg' | asset_url }}'},
+    nebula:{hero:'{{ 'nt2-24e0762935.jpg' | asset_url }}',second:'{{ 'nt2-59af1b0faf.jpg' | asset_url }}',third:'{{ 'nt2-10a048cb55.jpg' | asset_url }}',fourth:'{{ 'nt3-nebula-grey.jpg' | asset_url }}'},
+    polaris:{hero:'{{ 'nt2-aac124541d.jpg' | asset_url }}',second:'{{ 'nt2-239b934538.jpg' | asset_url }}',third:'{{ 'nt2-75f6686eb0.jpg' | asset_url }}'},
+    aurora:{hero:'{{ 'nt2-7b10235b18.jpg' | asset_url }}',second:'{{ 'nt2-4dafcb3752.jpg' | asset_url }}',third:'{{ 'nt3-aurora-eyes.jpg' | asset_url }}',fourth:'{{ 'nt2-af05a89048.jpg' | asset_url }}'},
+    venus:{hero:'{{ 'nt2-97304afdc7.jpg' | asset_url }}',second:'{{ 'nt2-0c2640f853.jpg' | asset_url }}',third:'{{ 'nt3-venus-dog.jpg' | asset_url }}',fourth:'{{ 'nt2-85cf6723f5.jpg' | asset_url }}'},
+  };
+  Object.keys(PDP_IMAGES).forEach(function(k){ window.NOTTERA_CASE_HERO[k] = PDP_IMAGES[k].hero; });
+  function buildPDP(root){
+    var fab=root.dataset.fab, color=root.dataset.color, F=FABS[fab], C=COLORS[color];
+    if(!F||!C){return;}
+    var slides='',thumbs='';
+    var imgs=PDP_IMAGES[color];
+    var slideList=imgs?[imgs.hero,imgs.second,imgs.third,imgs.fourth,imgs.fifth].filter(function(x){return x;}):[null,null];
+    slideList.forEach(function(src,i){
+      var tag=(i===0?'<span class="pdp2-tag'+(C.light?' is-light':'')+'">'+F.name+' · '+C.name+'</span>':'');
+      slides+=src
+        ? '<div class="pdp2-slide'+(i===0?' is-on':'')+'" data-i="'+i+'"><img class="pdp2-slide-img" src="'+src+'" alt="'+F.name+' pillowcase, '+C.name+'" loading="lazy">'+tag+'</div>'
+        : '<div class="pdp2-slide'+(i===0?' is-on':'')+'" data-i="'+i+'" style="background:'+C.sw+'">'+tag+'</div>';
+      thumbs+=src
+        ? '<button class="pdp2-thumb'+(i===0?' is-on':'')+'" data-i="'+i+'" style="background:#f7f5f1"><img src="'+src+'" alt="" loading="lazy" style="width:100%;height:100%;object-fit:cover"></button>'
+        : '<button class="pdp2-thumb'+(i===0?' is-on':'')+'" data-i="'+i+'" style="background:'+C.sw+'"></button>';
+    });
+    var pr=F.sizes.crescent, now=pr[0], was=pr[1];
+    var onSale=(color==='moonlight'||color==='polaris');
+    var priceHTML=onSale
+      ? '<span class="pdp2-now" id="pdp2Now">'+money(now)+'</span><span class="pdp2-was" id="pdp2Was">'+money(was)+'</span><span class="pdp2-save" id="pdp2Save">Save '+saving(now,was)+'%</span>'
+      : '<span class="pdp2-now" id="pdp2Now">'+money(now)+'</span>';
+    var specRows=F.specs.map(function(r){return '<tr><td>'+r[0]+'</td><td>'+r[1]+'</td></tr>';}).join('');
+    var dimRows='<tr><td>Crescent (Standard)</td><td>Fits the standard pillow — 55 × 35 cm</td></tr><tr><td>Eclipse (Oversized)</td><td>Fits the oversized pillow — 60 × 40 cm</td></tr>';
+    function acc(t,b,open){return '<div class="pdp2-acc-item'+(open?' open':'')+'"><button type="button" class="pdp2-acc-head">'+t+'</button><div class="pdp2-acc-body">'+b+'</div></div>';}
+    root.innerHTML=
+      '<div class="pdp2" data-fab="'+fab+'" data-color="'+color+'">'
+      +'<div class="pdp2-gallery">'
+        +'<div class="pdp2-main">'+slides+'<button class="pdp2-arrow prev" type="button" data-pdp-prev aria-label="Previous">‹</button><button class="pdp2-arrow next" type="button" data-pdp-next aria-label="Next">›</button></div>'
+        +'<div class="pdp2-thumbs">'+thumbs+'</div>'
+      +'</div>'
+      +'<div class="pdp2-info">'
+        +'<p class="pdp2-eyebrow">'+F.name+' Pillowcase</p>'
+        +'<h1 class="pdp2-title">'+C.name+'</h1>'
+        +'<div class="jdgm-widget jdgm-preview-badge" data-id="15698138202452" data-product-title="Ice-Silk Pillowcase"></div>'
+        +'<p class="pdp2-rating"><span>60-night trial &middot; 3-year warranty</span></p>'
+        +'<p class="pdp2-lead" style="color:var(--fg-soft);font-size:clamp(1rem, 1.4vw, 1.15rem);line-height:1.75;margin:0 0 1.5rem;max-width:34em">'+F.lead+'</p>'
+        +'<div class="pdp2-colour"><span class="bed-dot'+(C.light?' is-light':'')+'" style="background:'+C.sw+'"></span> Colour: <strong style="color:var(--fg);margin-left:.2rem">'+C.name+'</strong><a href="#/bed">View other colours</a></div>'
+        +'<div class="pdp2-price">'+priceHTML+'</div>'
+        +((color==='moonlight'||color==='polaris')?'<p class="pdp2-limited">✦ Limited time offer</p>':'')
+        +((color==='moonlight'||color==='polaris')?'<p class="pdp2-stock"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 9v4M12 17h.01"/><path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0Z"/></svg> Only a few left in '+C.name+' — one of our most-loved colours</p>':'')
+        +'<p class="pdp2-flabel">Size</p>'
+        +'<div class="pdp2-sizes">'
+          +'<button class="pdp2-size is-active" type="button" data-size="crescent"><strong>Crescent</strong><span>Standard</span></button>'
+          +'<button class="pdp2-size" type="button" data-size="eclipse"><strong>Eclipse</strong><span>Oversized</span></button>'
+        +'</div>'
+        +'<div class="pdp2-buyrow">'
+          +'<div class="pdp2-qty"><button type="button" data-pdp-qty="-1" aria-label="Decrease">−</button><input id="pdp2Qty" type="number" value="1" min="1" inputmode="numeric"><button type="button" data-pdp-qty="1" aria-label="Increase">+</button></div>'
+          +'<button class="btn btn-primary pdp2-add" type="button" id="pdp2Add" data-id="'+F.ids.crescent+'" data-variant="'+F.name+' · '+C.name+' · Crescent">Add to night</button>'
+          +'<button class="pdp2-fav" type="button" id="pdp2Fav" aria-label="Save to favorites">'+HEART+'</button>'
+        +'</div>'
+        +'<button class="btn btn-shop pdp2-shop" type="button" id="pdp2Shop" data-id="'+F.ids.crescent+'" data-variant="'+F.name+' · '+C.name+' · Crescent" aria-label="Buy now with Shop Pay"><svg class="shop-mark" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M16.2 7.1V6.4a4.2 4.2 0 0 0-8.4 0v.7H5.7a1 1 0 0 0-1 .9L3.6 18.9A1 1 0 0 0 4.6 20h14.8a1 1 0 0 0 1-1.1L19.3 8a1 1 0 0 0-1-.9h-2.1Zm-6.4-.7a2.2 2.2 0 1 1 4.4 0v.7H9.8v-.7Zm-.3 5.3a1.1 1.1 0 1 1 0-2.2 1.1 1.1 0 0 1 0 2.2Zm6.9 0a1.1 1.1 0 1 1 0-2.2 1.1 1.1 0 0 1 0 2.2Z"/></svg>Buy with <b>shop</b><span class="pay-tag">Pay</span></button>'
+        +'<p class="secure-badge"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="5" y="10" width="14" height="10" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3"/></svg> Secure checkout &middot; SSL encrypted</p><div class="secure-badge-icons"><svg class="pay-mark-sm" viewBox="0 0 40 26" role="img" aria-label="Visa"><rect width="40" height="26" rx="4.2" fill="#fff"/><text x="20" y="17.6" text-anchor="middle" font-family="Manrope,Arial,Helvetica,sans-serif" font-size="10.2" font-weight="800" font-style="italic" letter-spacing=".4" fill="#1434CB">VISA</text></svg><svg class="pay-mark-sm" viewBox="0 0 40 26" role="img" aria-label="Mastercard"><rect width="40" height="26" rx="4.2" fill="#fff"/><circle cx="16.6" cy="13" r="6.6" fill="#EB001B"/><circle cx="23.4" cy="13" r="6.6" fill="#F79E1B"/><path d="M20 7.9a6.6 6.6 0 0 0 0 10.2 6.6 6.6 0 0 0 0-10.2Z" fill="#FF5F00"/></svg><svg class="pay-mark-sm" viewBox="0 0 40 26" role="img" aria-label="American Express"><rect width="40" height="26" rx="4.2" fill="#006FCF"/><text x="20" y="12.4" text-anchor="middle" font-family="Manrope,Arial,Helvetica,sans-serif" font-size="6.1" font-weight="800" letter-spacing=".2" fill="#fff">AMERICAN</text><text x="20" y="19.4" text-anchor="middle" font-family="Manrope,Arial,Helvetica,sans-serif" font-size="6.1" font-weight="800" letter-spacing=".2" fill="#fff">EXPRESS</text></svg><svg class="pay-mark-sm" viewBox="0 0 40 26" role="img" aria-label="PayPal"><rect width="40" height="26" rx="4.2" fill="#fff"/><text x="20" y="17.2" text-anchor="middle" font-family="Manrope,Arial,Helvetica,sans-serif" font-size="9.4" font-weight="800" letter-spacing="-.2"><tspan fill="#003087">Pay</tspan><tspan fill="#009CDE">Pal</tspan></text></svg><svg class="pay-mark-sm" viewBox="0 0 40 26" role="img" aria-label="Apple Pay"><rect width="40" height="26" rx="4.2" fill="#fff"/><g fill="#000"><path d="M12.62 9.05c.3-.37.5-.88.44-1.39-.44.02-.97.29-1.28.66-.28.33-.53.85-.46 1.35.49.04.99-.25 1.3-.62Zm.44.71c-.71-.04-1.31.4-1.65.4-.34 0-.86-.38-1.41-.37-.73.01-1.4.42-1.77 1.07-.75 1.31-.2 3.25.54 4.31.36.52.79 1.11 1.35 1.09.54-.02.74-.35 1.39-.35.65 0 .83.35 1.4.34.58-.01.94-.53 1.3-1.06.41-.6.58-1.19.59-1.22-.01-.01-1.13-.44-1.14-1.73-.01-1.08.88-1.6.92-1.63-.5-.74-1.29-.83-1.57-.85Z"/><text x="23.6" y="17.4" text-anchor="middle" font-family="Manrope,Arial,Helvetica,sans-serif" font-size="9.6" font-weight="600" letter-spacing="-.1">Pay</text></g></svg><svg class="pay-mark-sm" viewBox="0 0 40 26" role="img" aria-label="Shop Pay"><rect width="40" height="26" rx="4.2" fill="#5a31f4"/><text x="20" y="17" text-anchor="middle" font-family="Manrope,Arial,Helvetica,sans-serif" font-size="7.4" font-weight="800" letter-spacing="-.1" fill="#fff">shop<tspan font-weight="400">Pay</tspan></text></svg></div>'
+        +'<ul class="pdp2-trust"><li>Ships in 7&ndash;14 business days</li><li>Free shipping over $65</li><li>30-day returns</li><li>Machine washable</li></ul>'
+        +'<div class="pdp2-acc">'
+          +acc('Details','<p>'+F.details+'</p>',true)
+          +acc('Dimensions','<table>'+dimRows+'</table><p style="margin:.8rem 0 0;font-style:italic;opacity:.7">Final dimensions confirmed at production.</p>',false)
+          +acc('Specifications','<table>'+specRows+'</table>',false)
+          +acc('Materials &amp; Care','<p>'+F.care+'</p>',false)
+          +acc('Shipping &amp; Returns','<p>Free shipping on US orders over $65. 30-day returns on unopened items.</p>',false)
+          +acc('Warranty','<p>3-year limited warranty against manufacturing defects — not everyday wear or misuse.</p>',false)
+        +'</div>'
+      +'</div></div>';
+    // set favourite state + variant defaults
+    updateFav(root, fab, color);
+  }
+
+  function currentPDP(){var el=document.querySelector('.pdp2'); return el?{fab:el.dataset.fab,color:el.dataset.color}:null;}
+  function selectSize(sizeK){
+    var el=document.querySelector('.pdp2'); if(!el) return;
+    var F=FABS[el.dataset.fab], C=COLORS[el.dataset.color], pr=F.sizes[sizeK], now=pr[0], was=pr[1];
+    var sz=SIZES.filter(function(s){return s.k===sizeK;})[0];
+    var q=function(id){return document.getElementById(id);};
+    if(q('pdp2Now'))q('pdp2Now').textContent=money(now);
+    if(q('pdp2Was'))q('pdp2Was').textContent=money(was);
+    if(q('pdp2Save'))q('pdp2Save').textContent='Save '+saving(now,was)+'%';
+    var add=q('pdp2Add'); if(add){add.dataset.id=F.ids[sizeK];add.dataset.variant=F.name+' · '+C.name+' · '+sz.name;}
+    var shop=q('pdp2Shop'); if(shop){shop.dataset.id=F.ids[sizeK];shop.dataset.variant=F.name+' · '+C.name+' · '+sz.name;}
+    Array.prototype.forEach.call(document.querySelectorAll('.pdp2-size'),function(b){b.classList.toggle('is-active',b.dataset.size===sizeK);});
+    var vt=document.querySelector('.pdp2-info .voltiers'); if(vt){var w=document.createElement('div'); w.innerHTML=caseVolTiersHTML(now); vt.replaceWith(w.firstChild);}
+  }
+  function goSlide(i){
+    var slides=document.querySelectorAll('.pdp2-slide'), thumbs=document.querySelectorAll('.pdp2-thumb');
+    if(!slides.length) return; var n=slides.length; i=((i%n)+n)%n;
+    Array.prototype.forEach.call(slides,function(s,k){s.classList.toggle('is-on',k===i);});
+    Array.prototype.forEach.call(thumbs,function(t,k){t.classList.toggle('is-on',k===i);});
+  }
+  function curSlide(){var on=document.querySelector('.pdp2-slide.is-on');return on?parseInt(on.dataset.i,10):0;}
+
+  /* ---- favourites ---- */
+  function favLoad(){try{var a=JSON.parse(localStorage.getItem('notterra-favs')||'[]');return Array.isArray(a)?a:[];}catch(e){return[];}}
+  function favSave(a){try{localStorage.setItem('notterra-favs',JSON.stringify(a));}catch(e){}}
+  function favHas(key){return favLoad().some(function(x){return x.key===key;});}
+  function favToggle(fab,color){
+    var key=fab+'-'+color, a=favLoad(), i=-1;
+    a.forEach(function(x,k){if(x.key===key)i=k;});
+    var adding = !(i>-1);
+    if(i>-1)a.splice(i,1); else a.push({key:key,fab:fab,color:color,name:COLORS[color].name,fabName:FABS[fab].name});
+    favSave(a); favRefresh();
+    if(adding) trackFavourite(fab,color);
+  }
+  /* Tells Klaviyo someone saved a product, so the "Saved for later" flow has
+     something to trigger on. Only fires on add, never on remove. Klaviyo can
+     only attach this to a person it already knows (a subscriber, or anyone who
+     arrived from one of our emails) — anonymous browsers simply produce nothing,
+     which is why this flow reaches fewer people than abandoned cart by design.
+     Requires the Klaviyo onsite snippet; guarded so the site works without it. */
+  function trackFavourite(fab,color){
+    try{
+      if(!window._learnq || typeof window._learnq.push !== 'function') return;
+      var C=COLORS[color], F=FABS[fab];
+      window._learnq.push(['track','Added to Favourites',{
+        ProductName: C.name + ' ' + F.name + ' Pillowcase',
+        Colour: C.name,
+        Fabric: F.name,
+        URL: 'https://www.mynottera.com/#/pc' + fab + color,
+        Price: F.sizes.crescent[0]
+      }]);
+    }catch(e){}
+  }
+  function updateFav(root,fab,color){
+    var btn=root.querySelector('#pdp2Fav'); if(!btn) return;
+    var on=favHas(fab+'-'+color); btn.classList.toggle('on',on); btn.innerHTML=on?HEARTF:HEART;
+  }
+  function favRefresh(){
+    var favs=favLoad();
+    var cnt=document.getElementById('favCount');
+    if(cnt){cnt.textContent=favs.length; cnt.hidden=favs.length===0;}
+    var ft=document.getElementById('favToggle'); if(ft)ft.classList.toggle('active',favs.length>0);
+    var list=document.getElementById('favList');
+    if(list){
+      if(!favs.length){list.innerHTML='<p class="fav-empty">No favourites yet.<br>Tap the heart on a product to save it.</p>';}
+      else{list.innerHTML=favs.map(function(x){var C=COLORS[x.color];var img=(window.NOTTERA_CASE_HERO||{})[x.color];var sw=img?'<img class="fav-sw" src="'+img+'" alt="'+x.name+' pillowcase" loading="lazy">':'<span class="fav-sw'+(C.light?' is-light':'')+'" style="background:'+C.sw+'"></span>';return '<div class="fav-item">'+sw+'<div class="fav-iname"><a href="#/pc'+x.fab+x.color+'" data-fav-go>'+x.name+'</a><div class="fav-imeta">'+x.fabName+' Pillowcase</div></div><button class="fav-rm" type="button" data-fav-rm="'+x.key+'" aria-label="Remove">×</button></div>';}).join('');}
+    }
+    var cur=currentPDP(); if(cur){var el=document.querySelector('.pdp2'); if(el)updateFav(el,cur.fab,cur.color);}
+  }
+
+  /* ---- inject the nav heart + favourites panel ---- */
+  function initFavUI(){
+    var navRight=document.querySelector('.nav-right'), cart=document.querySelector('.cart-toggle');
+    if(navRight&&cart&&!document.getElementById('favToggle')){
+      var b=document.createElement('button'); b.className='fav-toggle'; b.id='favToggle'; b.setAttribute('aria-label','Favorites');
+      b.innerHTML=HEART+'<span class="fav-count" id="favCount" hidden>0</span>';
+      navRight.insertBefore(b,cart);
+    }
+    if(!document.getElementById('favPanel')){
+      var p=document.createElement('div'); p.className='fav-panel'; p.id='favPanel';
+      p.innerHTML='<div class="fav-phead"><span class="fav-ptitle">Favourites</span><button class="fav-pclose" id="favClose" aria-label="Close">×</button></div><div class="fav-plist" id="favList"></div>';
+      document.body.appendChild(p);
+    }
+    favRefresh();
+  }
+
+  /* ---- events ----
+     Registered on the capture phase (the `true` below) and the product-card
+     branch calls stopImmediatePropagation(): third-party app-embed scripts
+     (Judge.me, Klaviyo, LoyaltyLi
+
